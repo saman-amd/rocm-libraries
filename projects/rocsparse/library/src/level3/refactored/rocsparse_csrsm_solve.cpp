@@ -422,12 +422,11 @@ rocsparse_status rocsparse::csrsm_compute(rocsparse_handle            handle,
     // It is assumed that B is transposed and has dimension nrhs x M
     //
     ROCSPARSE_ROUTINE_TRACE;
-
     RETURN_WITH_MESSAGE_IF_ROCSPARSE_ERROR((A_load_conjugate && op_A != rocsparse_operation_none)
                                                ? rocsparse_status_internal_error
                                                : rocsparse_status_success,
                                            "That's not the supposed configuration");
-
+    
     const int64_t M = A->rows;
     if(M == 0 || nrhs == 0)
     {
