@@ -3,6 +3,7 @@
 
 #include "harness/bundle/ReferenceOpCoverage.hpp"
 
+#include <algorithm>
 #include <stdexcept>
 
 #include <hipdnn_flatbuffers_sdk/flatbuffer_utilities/GraphWrapper.hpp>
@@ -47,19 +48,36 @@ const std::set<NodeAttributes>& gpuSupportedOps()
     return s_ops;
 }
 
-bool isFp8(hipdnn_flatbuffers_sdk::data_objects::DataType dataType)
+// No reference executor supports ragged or per-batch seq-len tensors yet.
+bool usesUnsupportedGraphFeatures(const void* graphBuffer, size_t size)
 {
-    using hipdnn_flatbuffers_sdk::data_objects::DataType;
-    switch(dataType)
+    try
     {
-    case DataType::FP8_E4M3:
-    case DataType::FP8_E5M2:
-    case DataType::FP8_E8M0:
-    case DataType::FP8_E4M3_FNUZ:
-    case DataType::FP8_E5M2_FNUZ:
-        return true;
-    default:
+        auto graph = hipdnn_flatbuffers_sdk::flatbuffer_utilities::GraphWrapper::fromSerializedBlob(
+            graphBuffer, size);
+        if(!hipdnn_flatbuffers_sdk::utilities::hasNoRaggedTensorIds(graph.getTensorMap()))
+        {
+            return true;
+        }
+        const auto setsSeqLen = [](const auto* attributes) {
+            return attributes != nullptr
+                   && (attributes->seq_len_q_tensor_uid().has_value()
+                       || attributes->seq_len_kv_tensor_uid().has_value());
+        };
+        for(uint32_t i = 0; i < graph.nodeCount(); ++i)
+        {
+            const auto& node = graph.getNode(i);
+            if(setsSeqLen(node.attributes_as_SdpaAttributes())
+               || setsSeqLen(node.attributes_as_SdpaBackwardAttributes()))
+            {
+                return true;
+            }
+        }
         return false;
+    }
+    catch(const std::exception&)
+    {
+        return true;
     }
 }
 
@@ -100,134 +118,56 @@ std::optional<std::set<NodeAttributes>> graphNodeTypes(const void* graphBuffer, 
     return types;
 }
 
-std::optional<bool> graphUsesRaggedTensors(const void* graphBuffer, size_t size)
+bool referenceCoversGraph(ReferenceExecutorType type, const void* graphBuffer, size_t size)
 {
-    try
+    const auto types = graphNodeTypes(graphBuffer, size);
+    if(!types.has_value() || types->empty())
     {
-        // Keep getTensorMap() inside the try: GraphWrapper's constructor does not
-        // throw on a bad buffer, throwIfNotValid() inside this accessor does.
-        auto graph = hipdnn_flatbuffers_sdk::flatbuffer_utilities::GraphWrapper::fromSerializedBlob(
-            graphBuffer, size);
-        return !hipdnn_flatbuffers_sdk::utilities::hasNoRaggedTensorIds(graph.getTensorMap());
+        return false;
     }
-    catch(const std::exception&)
-    {
-        return std::nullopt;
-    }
-}
 
-std::optional<bool> graphUsesFp8Tensors(const void* graphBuffer, size_t size)
-{
-    try
-    {
-        auto graph = hipdnn_flatbuffers_sdk::flatbuffer_utilities::GraphWrapper::fromSerializedBlob(
-            graphBuffer, size);
-        for(const auto& entry : graph.getTensorMap())
-        {
-            if(entry.second != nullptr && isFp8(entry.second->data_type()))
-            {
-                return true;
-            }
-        }
-    }
-    catch(const std::exception&)
-    {
-        return std::nullopt;
-    }
-    return false;
-}
-
-std::optional<bool> graphUsesSeqLenTensors(const void* graphBuffer, size_t size)
-{
-    try
-    {
-        auto graph = hipdnn_flatbuffers_sdk::flatbuffer_utilities::GraphWrapper::fromSerializedBlob(
-            graphBuffer, size);
-        const auto setsSeqLen = [](const auto* attributes) {
-            return attributes != nullptr
-                   && (attributes->seq_len_q_tensor_uid().has_value()
-                       || attributes->seq_len_kv_tensor_uid().has_value());
-        };
-        for(uint32_t i = 0; i < graph.nodeCount(); ++i)
-        {
-            const auto& node = graph.getNode(i);
-            if(setsSeqLen(node.attributes_as_SdpaAttributes())
-               || setsSeqLen(node.attributes_as_SdpaBackwardAttributes()))
-            {
-                return true;
-            }
-        }
-    }
-    catch(const std::exception&)
-    {
-        return std::nullopt;
-    }
-    return false;
+    const auto& supported = referenceSupportedOps(type);
+    return std::all_of(types->begin(),
+                       types->end(),
+                       [&supported](const auto nodeType) { return supported.count(nodeType) != 0; })
+           && !usesUnsupportedGraphFeatures(graphBuffer, size);
 }
 
 std::vector<std::string>
-    exclusionReasons(ReferenceExecutorType type, const void* graphBuffer, size_t size)
+    uncoveredNodeTypes(ReferenceExecutorType type, const void* graphBuffer, size_t size)
 {
-    // Repeated walks of the same buffer; runs only at registration time.
     const auto types = graphNodeTypes(graphBuffer, size);
-    const auto ragged = graphUsesRaggedTensors(graphBuffer, size);
-    const auto fp8 = graphUsesFp8Tensors(graphBuffer, size);
-    const auto seqLen = graphUsesSeqLenTensors(graphBuffer, size);
-    if(!types.has_value() || !ragged.has_value() || !fp8.has_value() || !seqLen.has_value())
+    if(!types.has_value())
     {
         return {std::string(K_UNREADABLE_GRAPH)};
     }
 
-    std::vector<std::string> reasons;
-    if(types->empty())
-    {
-        reasons.emplace_back(K_NO_NODES);
-    }
-
+    std::vector<std::string> uncovered;
     const auto& supported = referenceSupportedOps(type);
     for(const auto nodeType : *types)
     {
         if(supported.count(nodeType) == 0)
         {
-            reasons.emplace_back(
+            uncovered.emplace_back(
                 hipdnn_flatbuffers_sdk::data_objects::EnumNameNodeAttributes(nodeType));
         }
     }
-
-    if(*ragged)
-    {
-        reasons.emplace_back(K_RAGGED_TENSORS);
-    }
-    if(*seqLen)
-    {
-        reasons.emplace_back(K_SEQ_LEN_TENSORS);
-    }
-    // The GPU reference does not support FP8; the CPU reference may.
-    if(*fp8 && type == ReferenceExecutorType::GPU)
-    {
-        reasons.emplace_back(K_FP8_TENSORS);
-    }
-    return reasons;
+    return uncovered;
 }
 
-bool referenceCoversGraph(ReferenceExecutorType type, const void* graphBuffer, size_t size)
+std::string formatUncoveredOps(const std::set<std::string>& uncoveredOps)
 {
-    return exclusionReasons(type, graphBuffer, size).empty();
-}
-
-std::string formatExclusionReasons(const std::set<std::string>& reasons)
-{
-    if(reasons.empty())
+    if(uncoveredOps.empty())
     {
         return {};
     }
 
     std::string formatted = " (";
     const char* separator = "";
-    for(const auto& reason : reasons)
+    for(const auto& op : uncoveredOps)
     {
         formatted += separator;
-        formatted += reason;
+        formatted += op;
         separator = ", ";
     }
     formatted += ")";

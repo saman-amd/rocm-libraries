@@ -202,8 +202,13 @@ inline void registerBundles(const std::vector<LoadedBundle>& bundles,
     }
 }
 
-// Registers a test only for bundles with golden data that this reference is required to
-// handle, so the harness has no skip path; exclusion reasons for the rest are logged.
+// Registers one validation test per bundle this reference is *required* to handle
+// and for which golden data exists. Both conditions are checked here rather than in
+// the body precisely so the harness has no skip path: if a test exists, it must run
+// and pass.
+//
+// Bundles that fall outside the reference's supported-op set are simply absent from
+// the suite, and the count is logged so the gap is visible rather than silent.
 inline void registerReferenceValidationTests(const std::vector<LoadedBundle>& bundles,
                                              ReferenceExecutorType referenceType)
 {
@@ -211,8 +216,8 @@ inline void registerReferenceValidationTests(const std::vector<LoadedBundle>& bu
 
     size_t registered = 0;
     size_t noGolden = 0;
-    size_t excluded = 0;
-    std::set<std::string> reasons;
+    size_t uncovered = 0;
+    std::set<std::string> uncoveredOps;
 
     for(const auto& bundle : bundles)
     {
@@ -224,12 +229,16 @@ inline void registerReferenceValidationTests(const std::vector<LoadedBundle>& bu
         if(!referenceCoversGraph(
                referenceType, bundle.bundle->graphBuffer.data(), bundle.bundle->graphBuffer.size()))
         {
-            excluded++;
-            for(auto& reason : exclusionReasons(referenceType,
-                                                bundle.bundle->graphBuffer.data(),
-                                                bundle.bundle->graphBuffer.size()))
+            uncovered++;
+            // Name the ops responsible, not just the tally. The op set is a
+            // commitment (see ReferenceOpCoverage.hpp): "7 bundles excluded" says a
+            // gap exists, "7 excluded: ConvolutionBwdData, Reduction" says which one
+            // to close.
+            for(auto& nodeType : uncoveredNodeTypes(referenceType,
+                                                    bundle.bundle->graphBuffer.data(),
+                                                    bundle.bundle->graphBuffer.size()))
             {
-                reasons.insert(std::move(reason));
+                uncoveredOps.insert(std::move(nodeType));
             }
             continue;
         }
@@ -261,9 +270,9 @@ inline void registerReferenceValidationTests(const std::vector<LoadedBundle>& bu
     }
 
     std::cerr << "Golden-data validation (" << label << "): " << registered
-              << " bundle(s) registered, " << noGolden << " without golden data, " << excluded
-              << " excluded (unsupported op or graph feature)" << formatExclusionReasons(reasons)
-              << "\n";
+              << " bundle(s) registered, " << noGolden << " without golden data, " << uncovered
+              << " outside this reference's supported-op set or using ragged/seq-len tensors"
+              << formatUncoveredOps(uncoveredOps) << "\n";
 }
 
 } // namespace detail

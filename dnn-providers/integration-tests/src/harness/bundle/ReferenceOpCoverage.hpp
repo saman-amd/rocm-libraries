@@ -18,52 +18,53 @@ namespace hipdnn_integration_tests::bundle
 
 using NodeAttributes = hipdnn_flatbuffers_sdk::data_objects::NodeAttributes;
 
-/// Exclusion reasons that are not an op name. All start with '<' so they sort ahead
-/// of the op names they appear beside.
+/// Stands in for the node list of a graph whose buffer failed verification, in the
+/// one place a node list is only ever printed.
 inline constexpr std::string_view K_UNREADABLE_GRAPH = "<unreadable graph>";
-inline constexpr std::string_view K_RAGGED_TENSORS = "<ragged tensors>";
-inline constexpr std::string_view K_FP8_TENSORS = "<fp8 tensors>";
-inline constexpr std::string_view K_SEQ_LEN_TENSORS = "<seq-len tensors>";
-inline constexpr std::string_view K_NO_NODES = "<no nodes>";
 
-/// The node types each reference executor is required to handle. This is a contract:
-/// covered bundles are registered with no skip path, so adding an op obliges implementing
-/// it. Keyed on the flatbuffer node type, which is what the executors dispatch on.
-/// Graph features (ragged, FP8, seq-len) are gated separately by exclusionReasons().
+/// The ops each reference executor is *required* to handle.
+///
+/// This is a commitment, not a description. A bundle whose every node type appears
+/// in a reference's set is registered for validation against that reference and
+/// must pass — the reference harness has no skip path, because "the reference
+/// could not run this" is a gap in the reference, not a property of the bundle.
+///
+/// That inverts the previous arrangement, where a reference that could not handle a
+/// graph produced a silent skip and the bundle went unverified. Here the set is the
+/// contract: adding an op obliges someone to implement it for that reference;
+/// leaving it out means bundles using it are simply not validated by that
+/// reference, visibly, by their absence from the registered suite.
+///
+/// Keyed on the flatbuffer node type rather than the bundle's optional `operation`
+/// metadata string, because that is what both executors actually dispatch on and it
+/// cannot drift from the graph.
 const std::set<NodeAttributes>& referenceSupportedOps(ReferenceExecutorType type);
 
 /// Node types this graph uses, or nullopt when the buffer cannot be walked.
 ///
 /// The two cases are distinct and callers must keep them apart: a graph with no
-/// nodes is readable but has nothing to validate, an unreadable one is covered by
-/// none. Collapsing both onto an empty set loses that distinction.
+/// nodes is covered by every reference, an unreadable one is covered by none.
+/// Collapsing both onto an empty set makes referenceCoversGraph() and
+/// uncoveredNodeTypes() disagree -- "not covered, but nothing is uncovered".
 std::optional<std::set<NodeAttributes>> graphNodeTypes(const void* graphBuffer, size_t size);
 
-/// Whether any tensor in the graph is ragged, or nullopt when it cannot be walked.
-/// No reference executor, CPU or GPU, supports ragged tensors.
-std::optional<bool> graphUsesRaggedTensors(const void* graphBuffer, size_t size);
-
-/// Whether any tensor in the graph is an FP8 type, or nullopt when it cannot be walked.
-std::optional<bool> graphUsesFp8Tensors(const void* graphBuffer, size_t size);
-
-/// Whether any SDPA node sets a seq_len_q/kv tensor, or nullopt when it cannot be walked.
-/// No reference executor, CPU or GPU, supports per-batch sequence lengths.
-std::optional<bool> graphUsesSeqLenTensors(const void* graphBuffer, size_t size);
-
-/// Every reason this reference is not required to run this graph; empty means it is.
-/// An unreadable graph yields a single sentinel entry rather than nothing.
-std::vector<std::string>
-    exclusionReasons(ReferenceExecutorType type, const void* graphBuffer, size_t size);
-
-/// True iff exclusionReasons() is empty.
+/// True iff the graph is readable and every node in it is inside `type`'s
+/// required-op set, and it uses no ragged or seq-len tensors.
 bool referenceCoversGraph(ReferenceExecutorType type, const void* graphBuffer, size_t size);
 
-/// The parenthesised reason list appended to the registration summary, or "" when
-/// the set is empty.
+/// Human-readable node types the given reference does not cover, for diagnostics.
+///
+/// An unreadable graph yields a single sentinel entry rather than nothing, so a
+/// caller printing this never reports an exclusion with no reason attached.
+std::vector<std::string>
+    uncoveredNodeTypes(ReferenceExecutorType type, const void* graphBuffer, size_t size);
+
+/// The parenthesised op list appended to the registration summary, or "" when the
+/// set is empty.
 ///
 /// Split out from the summary line itself so it is testable without calling
 /// registerReferenceValidationTests(), which is inline and reaches
 /// sharedReferenceExecutors() -- the unit target deliberately does not link that.
-std::string formatExclusionReasons(const std::set<std::string>& reasons);
+std::string formatUncoveredOps(const std::set<std::string>& uncoveredOps);
 
 } // namespace hipdnn_integration_tests::bundle
