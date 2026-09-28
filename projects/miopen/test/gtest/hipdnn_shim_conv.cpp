@@ -7,13 +7,11 @@
 // buffer staging around them come from the shared test infrastructure, which the wrapper
 // does not sit in front of. Results are checked against an independent CPU reference rather
 // than a second MIOpen run. The "HipdnnShim" token in each suite name is what selects them
-// into the parity surface; see README.md. Built only under MIOPEN_ENABLE_HIPDNN_WRAPPER,
-// which keeps ctest -N identical to the flag-off baseline.
+// into the parity surface; see README.md. CMakeLists.txt builds this file only under
+// MIOPEN_ENABLE_HIPDNN_WRAPPER.
 //
 // Convolution is covered through both public entry points into it, because they are separate
 // code paths that will be swapped over to hipDNN independently.
-
-#ifdef MIOPEN_ENABLE_HIPDNN_WRAPPER
 
 #include <gtest/gtest.h>
 #include "get_handle.hpp"
@@ -28,9 +26,8 @@
 #include "../../src/private/routing.hpp"
 
 #include <algorithm>
-#include <cmath>
+#include <array>
 #include <limits>
-#include <memory>
 #include <string>
 #include <vector>
 
@@ -129,58 +126,69 @@ void InitConvDescriptor(OwnedConvDescriptor& conv,
 // Takes its tensors by non-const reference because the C entry point spells its descriptor
 // parameters `const miopenTensorDescriptor_t` — a const pointer to a non-const descriptor —
 // so a descriptor reached through a const tensor does not convert.
+// Fatal on failure: a failed query leaves an empty output, and an empty output compares
+// equal to an empty reference.
 template <class T>
-std::vector<std::size_t>
-OutputLengths(miopenConvolutionDescriptor_t conv_desc, tensor<T>& x, tensor<T>& w)
+void OutputLengths(miopenConvolutionDescriptor_t conv_desc,
+                   tensor<T>& x,
+                   tensor<T>& w,
+                   std::vector<std::size_t>& out_lengths)
 {
     const auto expected_dims = x.desc.GetNumDims();
     int out_dim_count        = 0;
     std::vector<int> out_dims(expected_dims);
-    EXPECT_EQ(miopenGetConvolutionNdForwardOutputDim(
+    ASSERT_EQ(miopenGetConvolutionNdForwardOutputDim(
                   conv_desc, &x.desc, &w.desc, &out_dim_count, out_dims.data()),
               miopenStatusSuccess);
-    EXPECT_EQ(out_dim_count, static_cast<int>(expected_dims));
-    return std::vector<std::size_t>(out_dims.begin(), out_dims.end());
+    ASSERT_EQ(out_dim_count, static_cast<int>(expected_dims));
+    out_lengths.assign(out_dims.begin(), out_dims.end());
 }
 
-// Cross-implementation comparison, not bit-reproducibility: same tolerance used by
-// ConvFwdSolverTestBase::ThresholdChecks() for FP32.
+// Scaffolding, not code under test, so internal helpers are fine in the reference checks; what
+// matters is that the reference is not another MIOpen solver.
 template <class T>
-void ExpectWithinTolerance(const tensor<T>& reference, const tensor<T>& got, const char* what)
+void CheckWithinTolerance(const tensor<T>& reference, const tensor<T>& got, const char* what)
 {
+    // rms_range() is 0 for two empty or two all-zero ranges, so without these a run that
+    // produced nothing would pass.
+    ASSERT_FALSE(miopen::range_zero(reference)) << what << ": CPU reference is all zeros";
+    ASSERT_FALSE(miopen::range_zero(got)) << what << ": GPU result is all zeros";
+    ASSERT_EQ(miopen::range_distance(reference), miopen::range_distance(got)) << what;
+    ASSERT_LT(miopen::find_idx(reference, miopen::not_finite), 0)
+        << what << ": non-finite value in the CPU reference";
+
+    // Cross-implementation comparison, not bit-reproducibility: same tolerance used by
+    // ConvFwdSolverTestBase::ThresholdChecks() for FP32.
     const double tolerance = std::numeric_limits<T>::epsilon() * 80;
     const double error     = miopen::rms_range(reference, got);
-    EXPECT_TRUE(std::isfinite(error)) << what;
     EXPECT_LT(error, tolerance) << what << " beyond cross-implementation tolerance";
 }
 
-// Scaffolding, not code under test, so internal helpers are fine here; what matters is that
-// the reference is not another MIOpen solver.
-void ExpectMatchesCpuReference(const tensor<float>& x, const tensor<float>& w, tensor<float>& y)
+void CheckMatchesCpuReference(const tensor<float>& x, const tensor<float>& w, tensor<float>& y)
 {
     tensor<float> ref_y{y.desc.GetLengths()};
     cpu_convolution_forward(pads.size(), x, w, ref_y, pads, strides, dilations, group_count);
-    ExpectWithinTolerance(ref_y, y, "convolution result");
+    CheckWithinTolerance(ref_y, y, "convolution result");
 }
 
-void ExpectMatchesCpuBackwardData(const tensor<float>& dx,
-                                  const tensor<float>& w,
-                                  const tensor<float>& dy)
+void CheckMatchesCpuBackwardData(const tensor<float>& dx,
+                                 const tensor<float>& w,
+                                 const tensor<float>& dy)
 {
     tensor<float> ref_dx{dx.desc.GetLengths()};
     cpu_convolution_backward_data(
         pads.size(), ref_dx, w, dy, pads, strides, dilations, group_count);
-    ExpectWithinTolerance(ref_dx, dx, "backward-data result");
+    CheckWithinTolerance(ref_dx, dx, "backward-data result");
 }
 
-void ExpectMatchesCpuBackwardWeights(const tensor<float>& x,
-                                     const tensor<float>& dw,
-                                     const tensor<float>& dy)
+void CheckMatchesCpuBackwardWeights(const tensor<float>& x,
+                                    const tensor<float>& dw,
+                                    const tensor<float>& dy)
 {
     tensor<float> ref_dw{dw.desc.GetLengths()};
     cpu_convolution_backward_weight(
         pads.size(), x, ref_dw, dy, pads, strides, dilations, group_count);
-    ExpectWithinTolerance(ref_dw, dw, "backward-weights result");
+    CheckWithinTolerance(ref_dw, dw, "backward-weights result");
 }
 
 // Half precision in a channels-last layout, because the only MIOpen solver that matches the
@@ -235,11 +243,11 @@ tensor<FusedType> MakeFusedBias(const FusedCase& config)
 //
 // The reference is built in the same layout as y so the two can be compared element by
 // element; the CPU convolution indexes logically, so it is layout-agnostic already.
-void ExpectMatchesCpuBiasActivation(const FusedCase& config,
-                                    const tensor<FusedType>& x,
-                                    const tensor<FusedType>& w,
-                                    const tensor<FusedType>& bias,
-                                    const tensor<FusedType>& y)
+void CheckMatchesCpuBiasActivation(const FusedCase& config,
+                                   const tensor<FusedType>& x,
+                                   const tensor<FusedType>& w,
+                                   const tensor<FusedType>& bias,
+                                   const tensor<FusedType>& y)
 {
     const std::vector<int> unit(config.pads.size(), 1);
     tensor<FusedType> ref_y{y.desc};
@@ -251,13 +259,7 @@ void ExpectMatchesCpuBiasActivation(const FusedCase& config,
         value                  = std::max(FusedType(0), biased);
     });
 
-    // ReLU makes an all-zero result a plausible-looking answer, so a kernel that wrote nothing
-    // would otherwise pass. Both sides are checked because an all-zero reference would mean the
-    // inputs, not the kernel, made the comparison vacuous.
-    EXPECT_FALSE(miopen::range_zero(ref_y)) << "CPU reference is all zeros";
-    EXPECT_FALSE(miopen::range_zero(y)) << "fused result is all zeros";
-
-    ExpectWithinTolerance(ref_y, y, "fused bias+activation result");
+    CheckWithinTolerance(ref_y, y, "fused bias+activation result");
 }
 
 // Whether the library computed the result or declined the problem, written into the JUnit XML
@@ -281,26 +283,61 @@ bool ForwardingEnabled()
     return miopen::wrapper::GetForwardingMode() == miopen::wrapper::ForwardingMode::Enabled;
 }
 
+// The setup the forward tests share: the same input, weights and convolution, the output shape
+// the library reports for them, and all three tensors on the device. A fatal failure in SetUp()
+// skips the test body, and the members still clean up.
+class HipdnnShimConvFwd : public ::testing::Test
+{
+protected:
+    void SetUp() override
+    {
+        ASSERT_NO_FATAL_FAILURE(InitConvDescriptor(conv));
+        std::vector<std::size_t> out_lengths;
+        ASSERT_NO_FATAL_FAILURE(OutputLengths(conv.handle, x, w, out_lengths));
+        y = tensor<float>{out_lengths};
+
+        x_dev = handle_deref.Write(x.data);
+        w_dev = handle_deref.Write(w.data);
+        y_dev = handle_deref.Write(y.data);
+    }
+
+    void ReadBackAndCheck()
+    {
+        y.data = handle_deref.Read<float>(y_dev, y.data.size());
+        CheckMatchesCpuReference(x, w, y);
+    }
+
+    miopen::Handle& handle_deref = get_handle();
+    miopenHandle_t handle        = &handle_deref;
+    tensor<float> x              = MakeInput();
+    tensor<float> w              = MakeWeights();
+    tensor<float> y;
+    OwnedConvDescriptor conv;
+    miopen::Allocator::ManageDataPtr x_dev;
+    miopen::Allocator::ManageDataPtr w_dev;
+    miopen::Allocator::ManageDataPtr y_dev;
+};
+
+// One subclass per path, so each keeps its own suite name: the parity filter and the GPU
+// exclusion patterns select by it.
+class GPU_HipdnnShimConvFwdApi_FP32 : public HipdnnShimConvFwd
+{
+};
+
+class GPU_HipdnnShimConvSolutionApi_FP32 : public HipdnnShimConvFwd
+{
+};
+
+class GPU_HipdnnShimConvDeclined_FP32 : public HipdnnShimConvFwd
+{
+};
+
 } // namespace
 
 // The Find/Run pair: the older of the two public convolution paths, and the one most callers
 // still use.
-TEST(GPU_HipdnnShimConvFwdApi_FP32, FindAndForwardMatchCpuReference)
+TEST_F(GPU_HipdnnShimConvFwdApi_FP32, FindAndForwardMatchCpuReference)
 {
-    auto& handle_deref    = get_handle();
-    miopenHandle_t handle = &handle_deref;
-
-    auto x = MakeInput();
-    auto w = MakeWeights();
-    OwnedConvDescriptor conv;
-    ASSERT_NO_FATAL_FAILURE(InitConvDescriptor(conv));
-    const auto out_lengths = OutputLengths(conv.handle, x, w);
-    tensor<float> y{out_lengths};
-
-    auto x_dev = handle_deref.Write(x.data);
-    auto w_dev = handle_deref.Write(w.data);
-    auto y_dev = handle_deref.Write(y.data);
-
     std::size_t workspace_size = 0;
     ASSERT_EQ(miopenConvolutionForwardGetWorkSpaceSize(
                   handle, &w.desc, &x.desc, conv.handle, &y.desc, &workspace_size),
@@ -343,29 +380,13 @@ TEST(GPU_HipdnnShimConvFwdApi_FP32, FindAndForwardMatchCpuReference)
                                        wspace.size()),
               miopenStatusSuccess);
 
-    y.data = handle_deref.Read<float>(y_dev, y.data.size());
-
-    ExpectMatchesCpuReference(x, w, y);
+    ReadBackAndCheck();
 }
 
 // The Problem/Solution path reaches the same convolution through different public entry
 // points, so it has to be swapped over separately and is covered separately.
-TEST(GPU_HipdnnShimConvSolutionApi_FP32, RunSolutionMatchesCpuReference)
+TEST_F(GPU_HipdnnShimConvSolutionApi_FP32, RunSolutionMatchesCpuReference)
 {
-    auto& handle_deref    = get_handle();
-    miopenHandle_t handle = &handle_deref;
-
-    auto x = MakeInput();
-    auto w = MakeWeights();
-    OwnedConvDescriptor conv;
-    ASSERT_NO_FATAL_FAILURE(InitConvDescriptor(conv));
-    const auto out_lengths = OutputLengths(conv.handle, x, w);
-    tensor<float> y{out_lengths};
-
-    auto x_dev = handle_deref.Write(x.data);
-    auto w_dev = handle_deref.Write(w.data);
-    auto y_dev = handle_deref.Write(y.data);
-
     OwnedProblem problem;
     ASSERT_EQ(miopenCreateConvProblem(&problem.handle, conv.handle, miopenProblemDirectionForward),
               miopenStatusSuccess);
@@ -389,26 +410,19 @@ TEST(GPU_HipdnnShimConvSolutionApi_FP32, RunSolutionMatchesCpuReference)
     ASSERT_EQ(miopenGetSolutionWorkspaceSize(solutions[0], &workspace_size), miopenStatusSuccess);
     Workspace wspace{workspace_size};
 
-    miopenTensorArgumentId_t names[3] = {
-        miopenTensorConvolutionX, miopenTensorConvolutionW, miopenTensorConvolutionY};
-    void* buffers[3]                        = {x_dev.get(), w_dev.get(), y_dev.get()};
     miopenTensorDescriptor_t descriptors[3] = {&x.desc, &w.desc, &y.desc};
-
-    auto arguments = std::make_unique<miopenTensorArgument_t[]>(3);
-    for(auto i = 0; i < 3; ++i)
-    {
-        arguments[i].id         = names[i];
-        arguments[i].descriptor = &descriptors[i];
-        arguments[i].buffer     = buffers[i];
-    }
+    const std::array<miopenTensorArgument_t, 3> arguments{{
+        {miopenTensorConvolutionX, &descriptors[0], x_dev.get()},
+        {miopenTensorConvolutionW, &descriptors[1], w_dev.get()},
+        {miopenTensorConvolutionY, &descriptors[2], y_dev.get()},
+    }};
 
     ASSERT_EQ(
-        miopenRunSolution(handle, solutions[0], 3, arguments.get(), wspace.ptr(), wspace.size()),
+        miopenRunSolution(
+            handle, solutions[0], arguments.size(), arguments.data(), wspace.ptr(), wspace.size()),
         miopenStatusSuccess);
 
-    y.data = handle_deref.Read<float>(y_dev, y.data.size());
-
-    ExpectMatchesCpuReference(x, w, y);
+    ReadBackAndCheck();
 }
 
 TEST(GPU_HipdnnShimConvBwdDataApi_FP32, BackwardDataMatchesCpuReference)
@@ -420,7 +434,8 @@ TEST(GPU_HipdnnShimConvBwdDataApi_FP32, BackwardDataMatchesCpuReference)
     auto w = MakeWeights();
     OwnedConvDescriptor conv;
     ASSERT_NO_FATAL_FAILURE(InitConvDescriptor(conv));
-    const auto out_lengths = OutputLengths(conv.handle, x, w);
+    std::vector<std::size_t> out_lengths;
+    ASSERT_NO_FATAL_FAILURE(OutputLengths(conv.handle, x, w, out_lengths));
 
     tensor<float> dy{out_lengths};
     dy.generate(tensor_elem_gen_integer{17});
@@ -474,7 +489,7 @@ TEST(GPU_HipdnnShimConvBwdDataApi_FP32, BackwardDataMatchesCpuReference)
 
     dx.data = handle_deref.Read<float>(dx_dev, dx.data.size());
 
-    ExpectMatchesCpuBackwardData(dx, w, dy);
+    CheckMatchesCpuBackwardData(dx, w, dy);
 }
 
 TEST(GPU_HipdnnShimConvBwdWeightsApi_FP32, BackwardWeightsMatchesCpuReference)
@@ -486,7 +501,8 @@ TEST(GPU_HipdnnShimConvBwdWeightsApi_FP32, BackwardWeightsMatchesCpuReference)
     auto w = MakeWeights();
     OwnedConvDescriptor conv;
     ASSERT_NO_FATAL_FAILURE(InitConvDescriptor(conv));
-    const auto out_lengths = OutputLengths(conv.handle, x, w);
+    std::vector<std::size_t> out_lengths;
+    ASSERT_NO_FATAL_FAILURE(OutputLengths(conv.handle, x, w, out_lengths));
 
     tensor<float> dy{out_lengths};
     dy.generate(tensor_elem_gen_integer{17});
@@ -540,7 +556,7 @@ TEST(GPU_HipdnnShimConvBwdWeightsApi_FP32, BackwardWeightsMatchesCpuReference)
 
     dw.data = handle_deref.Read<float>(dw_dev, dw.data.size());
 
-    ExpectMatchesCpuBackwardWeights(x, dw, dy);
+    CheckMatchesCpuBackwardWeights(x, dw, dy);
 }
 
 void RunFusedCase(const FusedCase& config)
@@ -559,7 +575,8 @@ void RunFusedCase(const FusedCase& config)
     const std::vector<int> unit(config.pads.size(), 1);
     OwnedConvDescriptor conv;
     ASSERT_NO_FATAL_FAILURE(InitConvDescriptor(conv, miopenConvolution, config.pads, unit, unit));
-    const auto out_lengths = OutputLengths(conv.handle, x, w);
+    std::vector<std::size_t> out_lengths;
+    ASSERT_NO_FATAL_FAILURE(OutputLengths(conv.handle, x, w, out_lengths));
     tensor<FusedType> y{config.layout, out_lengths};
     tensor<FusedType> z{config.layout, out_lengths};
 
@@ -624,7 +641,7 @@ void RunFusedCase(const FusedCase& config)
 
     y.data = handle_deref.Read<FusedType>(y_dev, y.data.size());
 
-    ExpectMatchesCpuBiasActivation(config, x, w, bias, y);
+    CheckMatchesCpuBiasActivation(config, x, w, bias, y);
 }
 
 TEST(GPU_HipdnnShimConvBiasActivApi_FP16, FusedForwardMatchesCpuReference)
@@ -636,24 +653,10 @@ TEST(GPU_HipdnnShimConvBiasActivApi_FP16, FusedForwardMatchesCpuReference)
 // Every problem here is one MIOpen itself accepts. What is being checked is that the hipDNN
 // path recognises it cannot express them and says so, instead of quietly producing a result
 // that is wrong in a way no tolerance would catch.
-TEST(GPU_HipdnnShimConvDeclined_FP32, UnexpressibleProblemsReturnUnsupported)
+TEST_F(GPU_HipdnnShimConvDeclined_FP32, UnexpressibleProblemsReturnUnsupported)
 {
     if(!ForwardingEnabled())
         return;
-
-    auto& handle_deref    = get_handle();
-    miopenHandle_t handle = &handle_deref;
-
-    auto x = MakeInput();
-    auto w = MakeWeights();
-    OwnedConvDescriptor conv;
-    ASSERT_NO_FATAL_FAILURE(InitConvDescriptor(conv));
-    const auto out_lengths = OutputLengths(conv.handle, x, w);
-    tensor<float> y{out_lengths};
-
-    auto x_dev = handle_deref.Write(x.data);
-    auto w_dev = handle_deref.Write(w.data);
-    auto y_dev = handle_deref.Write(y.data);
 
     // The declines happen before any hipDNN object is built, so no workspace is needed to
     // reach them.
@@ -705,7 +708,8 @@ TEST(GPU_HipdnnShimConvDeclined_FP32, UnexpressibleProblemsReturnUnsupported)
     {
         OwnedConvDescriptor transposed;
         ASSERT_NO_FATAL_FAILURE(InitConvDescriptor(transposed, miopenTranspose));
-        const auto transposed_lengths = OutputLengths(transposed.handle, x, w);
+        std::vector<std::size_t> transposed_lengths;
+        ASSERT_NO_FATAL_FAILURE(OutputLengths(transposed.handle, x, w, transposed_lengths));
         tensor<float> transposed_y{transposed_lengths};
         auto transposed_y_dev = handle_deref.Write(transposed_y.data);
 
@@ -726,5 +730,3 @@ TEST(GPU_HipdnnShimConvDeclined_FP32, UnexpressibleProblemsReturnUnsupported)
             << "transposed convolution";
     }
 }
-
-#endif // MIOPEN_ENABLE_HIPDNN_WRAPPER

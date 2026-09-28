@@ -3,61 +3,26 @@
 # SPDX-License-Identifier: MIT
 """Run the hipDNN forwarding parity harness.
 
-This is the command behind a single ctest entry. It replays the shim surface
-twice -- once with forwarding disabled, once with it enabled -- compares the two
-runs test for test, and then checks the wrapper's exported ABI.
-
-Three steps in one process rather than three ctest entries tied together by a
-fixture: a sharded ctest run distributes whole entries, so the members of a
-fixture can land in different shards and fail as unsatisfied. Sequencing them
-here also keeps the fixture's best property, that a replay which dies never
-reaches the comparison, without depending on ctest to enforce it.
-
-The two replays can only diverge for entry points named in kForwardingEntries, in
-src/private/routing.cpp, so that array is what this entry has detection power
-over. A test that exercises an entry point outside it runs identical code twice.
-
-Registered only where MIOPEN_ENABLE_HIPDNN_WRAPPER is on, so it never has to
-work out which kind of tree it is running in. It runs from both the build tree
-and an installed one, which differ only in where its inputs sit; the defaults
-below suit the installed layout, where everything lands in one directory.
+Replays the shim surface with forwarding disabled and then enabled, and compares
+the two runs test for test. See test/gtest/README.md for how it is registered.
 """
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
+from miopen_wrapper_libs import resolve_pair
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 
-def find_library(lib_dirs, stem):
-    """Return the one versioned shared object for `stem`, or (None, reason).
-
-    Symlinks are skipped so the versioned file is what gets inspected. A second
-    versioned file beside it is a half-replaced earlier build -- exactly what the
-    co-versioning check downstream exists to catch -- and choosing between them
-    would pick by filename order, which is not version order. So both the zero
-    and the many case are reported rather than resolved.
-    """
-    searched = ", ".join(str(d) for d in lib_dirs) or "<no lib directory>"
-    for lib_dir in lib_dirs:
-        matches = [
-            p
-            for p in sorted(lib_dir.glob(f"{stem}.so.*"))
-            if p.is_file() and not p.is_symlink()
-        ]
-        if len(matches) == 1:
-            return matches[0], None
-        if matches:
-            listed = ", ".join(p.name for p in matches)
-            return None, (
-                f"{lib_dir} holds more than one {stem}.so.*: {listed}. One of them is "
-                "left over from an earlier build; remove it and run again."
-            )
-    return None, f"no {stem}.so.* found under {searched}"
+# Printed by the library when forwarding is enabled; the only outside sign of
+# which mode a replay actually ran in.
+ENABLED_BANNER = "[MIOpen] MIOPEN_HIPDNN_FORWARDING="
 
 
 def run(argv, what, env=None):
@@ -66,6 +31,44 @@ def run(argv, what, env=None):
     if code != 0:
         print(f"FAIL: {what} exited {code}", flush=True)
     return code == 0
+
+
+def replay(argv, mode, env):
+    what = f"forwarding={mode} replay"
+    print(f"+ {' '.join(str(a) for a in argv)}", flush=True)
+    # Passed through line by line rather than after exit: if ctest's timeout kills
+    # a hung replay, whatever it printed up to then is the only clue to why.
+    announced = False
+    with subprocess.Popen(
+        [str(a) for a in argv],
+        env=env,
+        stderr=subprocess.PIPE,
+        text=True,
+        errors="replace",
+    ) as proc:
+        for line in proc.stderr:
+            sys.stderr.write(line)
+            sys.stderr.flush()
+            announced = announced or ENABLED_BANNER in line
+    if proc.returncode != 0:
+        print(f"FAIL: {what} exited {proc.returncode}", flush=True)
+        return False
+
+    if mode == "enabled" and not announced:
+        print(
+            f"FAIL: {what} never printed '{ENABLED_BANNER}...', so it ran with "
+            "forwarding disabled.",
+            flush=True,
+        )
+        return False
+    if mode == "disabled" and announced:
+        print(
+            f"FAIL: {what} printed '{ENABLED_BANNER}...', so it ran with "
+            "forwarding enabled.",
+            flush=True,
+        )
+        return False
+    return True
 
 
 def main():
@@ -84,84 +87,72 @@ def main():
         "this script's parent directory",
     )
     parser.add_argument("--compare", default=SCRIPT_DIR / "compare_forwarding_runs.py")
-    parser.add_argument("--abi-check", default=SCRIPT_DIR / "check_public_abi.py")
     parser.add_argument(
         "--known-divergences", default=SCRIPT_DIR / "known_forwarding_divergences.txt"
-    )
-    parser.add_argument("--baseline", default=SCRIPT_DIR / "public_symbols.baseline")
-    parser.add_argument(
-        "--excluded", default=SCRIPT_DIR / "wrapper_excluded_symbols.txt"
-    )
-    parser.add_argument(
-        "--needed-baseline", default=SCRIPT_DIR / "wrapper_needed.baseline"
     )
     args = parser.parse_args()
 
     gtest = Path(args.gtest).resolve()
-    # A temporary directory rather than the working directory, because ctest runs the installed
-    # entry from inside the install tree, which on a shipping prefix is root-owned and read-only
-    # to whoever runs the tests. The XMLs feed the comparison below and nothing else, so they do
-    # not need to outlive the run; the location is printed to keep a failure diagnosable.
-    if args.output_dir:
-        output_dir = Path(args.output_dir).resolve()
-        output_dir.mkdir(parents=True, exist_ok=True)
-    else:
-        output_dir = Path(tempfile.mkdtemp(prefix="miopen_forwarding_parity_"))
-    print(f"replay reports: {output_dir}", flush=True)
 
     lib_dirs = (
         [Path(args.lib_dir)] if args.lib_dir else sorted(SCRIPT_DIR.parent.glob("lib*"))
     )
-    wrapper_lib, wrapper_problem = find_library(lib_dirs, "libMIOpen")
-    private_lib, private_problem = find_library(lib_dirs, "libMIOpen_private")
-    problems = [p for p in (wrapper_problem, private_problem) if p]
+    wrapper_lib, private_lib, problems = resolve_pair(lib_dirs)
     if problems:
         # Both are built whenever this entry is registered, so a missing one is a
-        # packaging or layout regression rather than a configuration to skip over.
-        # Resolved before the replays so that regression is reported directly
-        # instead of as a loader error inside the first replay.
+        # packaging regression, not something to skip.
         for problem in problems:
             print(f"FAIL: {problem}", flush=True)
         return 1
-    # Named, so a co-versioning failure below can be tied back to the files it is about.
     print(f"libraries under test: {wrapper_lib}, {private_lib}", flush=True)
 
-    # The replays have to load the pair the ABI check inspects. An installed test
-    # binary's RUNPATH names the ROCm library directory, not the tree it was
-    # installed into, so without this an install to any other prefix silently
-    # replays some other MIOpen -- or, with no private library beside it, fails
-    # to start at all.
+    # An installed test binary's RUNPATH names the ROCm library directory, so an
+    # install to any other prefix would otherwise load some other MIOpen.
     ld_path = os.pathsep.join(
         p for p in (str(private_lib.parent), os.environ.get("LD_LIBRARY_PATH")) if p
     )
 
+    # Not the working directory: ctest runs the installed entry inside the install
+    # tree, which may be read-only. Kept after a failure for inspection.
+    temporary = not args.output_dir
+    if temporary:
+        output_dir = Path(tempfile.mkdtemp(prefix="miopen_forwarding_parity_"))
+    else:
+        output_dir = Path(args.output_dir).resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"replay reports: {output_dir}", flush=True)
+
     reports = []
     for mode in ("disabled", "enabled"):
         report = output_dir / f"{gtest.name}_forwarding_{mode}.xml"
-        # Removed rather than overwritten: a replay that dies before writing would
-        # otherwise leave the previous run's file for the comparison to read.
+        # A replay that dies before writing must not leave an old report behind.
         report.unlink(missing_ok=True)
         reports.append(report)
-        env = dict(os.environ, MIOPEN_HIPDNN_FORWARDING=mode, LD_LIBRARY_PATH=ld_path)
-        ok = run(
+        # A database and kernel cache per mode, so the enabled replay cannot reuse
+        # what the disabled one found and compiled.
+        cache = output_dir / f"{mode}_cache"
+        env = dict(
+            os.environ,
+            MIOPEN_HIPDNN_FORWARDING=mode,
+            LD_LIBRARY_PATH=ld_path,
+            MIOPEN_USER_DB_PATH=str(cache),
+            MIOPEN_CUSTOM_CACHE_DIR=str(cache),
+        )
+        ok = replay(
             [
                 gtest,
                 f"--gtest_filter={args.filter}",
                 f"--gtest_output=xml:{report}",
             ],
-            f"forwarding={mode} replay",
-            env=env,
+            mode,
+            env,
         )
         if not ok:
-            # Short-circuit: the comparison of a run that failed reports whatever
-            # partial XML it left behind, which buries the failure that caused it.
+            # Comparing a partial report would bury the failure that caused it.
             return 1
 
-    # --newer-than: two XML files left over from an earlier build compare just as
-    # cleanly as two fresh ones, so it holds the replays to this run's binary.
-    # Both helpers are launched through this interpreter rather than their shebangs,
-    # so the harness and the scripts it drives cannot end up on different Pythons,
-    # and a lost exec bit becomes a FAIL line instead of a PermissionError traceback.
+    # --newer-than rejects stale reports from an earlier build. sys.executable rather
+    # than the shebang, so a lost exec bit fails cleanly.
     ok = run(
         [
             sys.executable,
@@ -175,27 +166,8 @@ def main():
         "forwarding parity comparison",
     )
 
-    # --public-header is deliberately absent: the check it enables compares the
-    # exclusion list against miopen.h, both source files, so it belongs to the
-    # build and an installed tree has no include directory to point it at.
-    ok &= run(
-        [
-            sys.executable,
-            args.abi_check,
-            "check-wrapper",
-            wrapper_lib,
-            "--baseline",
-            args.baseline,
-            "--excluded",
-            args.excluded,
-            "--needed-baseline",
-            args.needed_baseline,
-            "--private-lib",
-            private_lib,
-        ],
-        "wrapper ABI check",
-    )
-
+    if ok and temporary:
+        shutil.rmtree(output_dir)
     return 0 if ok else 1
 
 

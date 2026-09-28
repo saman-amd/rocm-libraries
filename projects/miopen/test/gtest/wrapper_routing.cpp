@@ -9,9 +9,9 @@
 //
 // ParseForwardingMode, IsInForwardingSet and ResolveRoute take their inputs
 // explicitly, so both routes and all reporting are testable without touching the
-// environment. GetForwardingMode()/Dispatch() are covered on the default path
-// only: their cache is a function-local static that cannot be reset once
-// initialized.
+// environment. GetForwardingMode()/Dispatch() cache the mode on first use, so
+// their tests accept whatever the variable is set to rather than clearing it:
+// the parity harness sets it for shim tests in this same binary.
 
 #include <gtest/gtest.h>
 
@@ -75,29 +75,6 @@ using miopen::wrapper::RouteReason;
 // Duplicated rather than included: they are internal to routing.cpp.
 constexpr const char* kForwardingEnvVar = "MIOPEN_HIPDNN_FORWARDING";
 constexpr const char* kDisableEnvVar    = "MIOPEN_DISABLE_HIPDNN_FOR";
-
-// GetForwardingMode() caches the parsed mode on first use, so whatever the
-// launching shell had MIOPEN_HIPDNN_FORWARDING set to would otherwise leak into
-// CPU_WrapperRoutingDispatch_NONE with no way to undo it. Clearing it from a
-// global test environment happens before any test body runs.
-class ForwardingEnvSetup : public ::testing::Environment
-{
-public:
-    void SetUp() override
-    {
-#ifdef _WIN32
-        // Windows has no unsetenv; the empty string is how a variable is
-        // removed, and the parser treats empty the same as unset.
-        _putenv_s(kForwardingEnvVar, "");
-#else
-        unsetenv(kForwardingEnvVar);
-#endif
-    }
-};
-
-// GoogleTest takes ownership; the returned handle is unused.
-[[maybe_unused]] const ::testing::Environment* const kForwardingEnvSetup =
-    ::testing::AddGlobalTestEnvironment(new ForwardingEnvSetup);
 
 // Injected so the routing logic is exercised against a set this test controls,
 // independently of whatever the build happens to forward. "miopenCreate" is here
@@ -522,23 +499,24 @@ TEST(CPU_WrapperRoutingStubName_NONE, DispatchFromStubAgreesWithDispatch)
 }
 
 // ---------------------------------------------------------------------------
-// The process-global path. ForwardingEnvSetup clears the environment variable
-// before any test runs, so the mode is Disabled and everything routes to MIOpen.
+// The process-global path.
 // ---------------------------------------------------------------------------
 
 class CPU_WrapperRoutingDispatch_NONE : public ::testing::TestWithParam<const char*>
 {
 };
 
-TEST_P(CPU_WrapperRoutingDispatch_NONE, DefaultRoutesToMiopen)
+TEST_P(CPU_WrapperRoutingDispatch_NONE, AgreesWithResolveRoute)
 {
     const char* entryPoint = GetParam();
-    EXPECT_EQ(GetForwardingMode(), ForwardingMode::Disabled);
-    // Dispatch is ResolveRoute over the process-wide mode...
-    EXPECT_EQ(Dispatch(entryPoint), ResolveRoute(GetForwardingMode(), entryPoint))
+    std::ostringstream ignored;
+    EXPECT_EQ(GetForwardingMode(), ParseForwardingMode(std::getenv(kForwardingEnvVar), ignored));
+    EXPECT_EQ(Dispatch(entryPoint),
+              ResolveRoute(GetForwardingMode(),
+                           entryPoint,
+                           miopen::wrapper::DefaultForwardingSet(),
+                           miopen::wrapper::GetDisabledSet()))
         << "entryPoint=" << entryPoint;
-    // ...which on the default path is MIOpen.
-    EXPECT_EQ(Dispatch(entryPoint), Route::Miopen) << "entryPoint=" << entryPoint;
 }
 
 INSTANTIATE_TEST_SUITE_P(Smoke,
@@ -546,6 +524,22 @@ INSTANTIATE_TEST_SUITE_P(Smoke,
                          ::testing::Values("miopenConvolutionForward",
                                            "miopenCreate",
                                            "miopenGetErrorString"));
+
+class CPU_WrapperRoutingDispatchUnforwarded_NONE : public ::testing::TestWithParam<const char*>
+{
+};
+
+// In either mode: forwarding only ever redirects entry points in the set.
+TEST_P(CPU_WrapperRoutingDispatchUnforwarded_NONE, RoutesToMiopen)
+{
+    const char* entryPoint = GetParam();
+    ASSERT_FALSE(IsInForwardingSet(entryPoint, miopen::wrapper::DefaultForwardingSet()));
+    EXPECT_EQ(Dispatch(entryPoint), Route::Miopen) << "entryPoint=" << entryPoint;
+}
+
+INSTANTIATE_TEST_SUITE_P(Smoke,
+                         CPU_WrapperRoutingDispatchUnforwarded_NONE,
+                         ::testing::Values("miopenCreate", "miopenGetErrorString"));
 
 } // namespace
 

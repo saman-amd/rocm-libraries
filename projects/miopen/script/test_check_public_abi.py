@@ -22,7 +22,6 @@ or GPU is needed and the module runs in a lint lane:
     python -m pytest projects/miopen/script/test_check_public_abi.py
 """
 
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -501,83 +500,116 @@ def test_read_tracked_source_rejects_paths_outside_the_root(tmp_path):
     assert "outside the repository root" in "".join(reasons.values())
 
 
-needs_git = pytest.mark.skipif(shutil.which("git") is None, reason="git not available")
+# run_git() is the script's single shell-out, so the cases below are built by
+# replacing it rather than by standing up a real repository. An earlier version did
+# the latter, and `git init` in a temporary directory turned out to be unsafe here:
+# git exports GIT_DIR into the hooks it runs and GIT_DIR outranks -C, so under the
+# pre-commit hook these tests run from, the init reached the surrounding repository
+# and left it marked bare, which refuses every later commit.
 
 
-def _git(root: Path, *args: str) -> str:
-    done = subprocess.run(
-        ["git", "-C", str(root), *args], capture_output=True, text=True, check=True
-    )
-    return done.stdout.strip()
+def _completed(returncode=0, stdout=b"", stderr=b""):
+    return subprocess.CompletedProcess(["git"], returncode, stdout, stderr)
 
 
-def _repo_with_unreadable_blob(tmp_path: Path) -> tuple[Path, Path]:
-    """Build the exact shape a failed promisor fetch leaves behind.
+def _unreadable_blob_git(tracked: bool, cat_file_stderr: bytes = b"fatal: bad object"):
+    """Stand in for the shape a failed promisor fetch leaves behind.
 
-    The commit's tree still names the file -- so ls-tree answers -- while the
-    blob it points at is gone, so cat-file cannot produce the content. Deleting
-    the loose object reproduces that locally without needing a partial clone or
-    a network.
+    The commit's tree still names the file, so ls-tree answers, while the blob it
+    points at is gone, so cat-file cannot produce the content.
     """
-    root = tmp_path / "repo"
-    root.mkdir()
-    target = root / "tracked.hpp"
-    target.write_text("#pragma once\n", encoding="utf-8")
-    _git(root, "init", "-q")
-    _git(root, "config", "user.email", "nobody@example.invalid")
-    _git(root, "config", "user.name", "Test")
-    _git(root, "add", "tracked.hpp")
-    _git(root, "commit", "-qm", "add tracked.hpp")
-    blob = _git(root, "rev-parse", "HEAD:tracked.hpp")
-    target.unlink()
-    (root / ".git" / "objects" / blob[:2] / blob[2:]).unlink()
-    return root, target
+
+    def run_git(repo_root, *args):
+        if args[0] == "cat-file":
+            return _completed(1, stderr=cat_file_stderr)
+        if args[0] == "ls-tree":
+            return _completed(0, stdout=b"tracked.hpp\n" if tracked else b"")
+        raise AssertionError(f"unexpected git call: {args}")
+
+    return run_git
 
 
-@needs_git
-def test_tracked_but_unreadable_file_is_a_hard_failure(tmp_path):
+def test_tracked_but_unreadable_file_is_a_hard_failure(tmp_path, monkeypatch):
     """A checkout that carries the file but cannot produce it must not go green.
 
     Skipping here would drop a file that is under test out of the comparison
     while still reporting success, which is the one outcome this gate cannot
     afford: the drift it catches links cleanly and only misbehaves at run time.
     """
-    root, target = _repo_with_unreadable_blob(tmp_path)
+    monkeypatch.setattr(abi, "run_git", _unreadable_blob_git(tracked=True))
     with pytest.raises(abi.AbiError) as caught:
-        abi.read_tracked_source(target, root, {})
+        abi.read_tracked_source(tmp_path / "tracked.hpp", tmp_path, {})
     assert "tracked.hpp" in str(caught.value)
 
 
-@needs_git
-def test_the_hard_failure_carries_git_stderr(tmp_path):
+def test_the_hard_failure_carries_git_stderr(tmp_path, monkeypatch):
     """Whatever git said is the only evidence of why the checkout is broken."""
-    root, target = _repo_with_unreadable_blob(tmp_path)
+    monkeypatch.setattr(
+        abi,
+        "run_git",
+        _unreadable_blob_git(tracked=True, cat_file_stderr=b"fatal: missing blob abc"),
+    )
     with pytest.raises(abi.AbiError) as caught:
-        abi.read_tracked_source(target, root, {})
+        abi.read_tracked_source(tmp_path / "tracked.hpp", tmp_path, {})
     message = str(caught.value)
     assert "git cat-file said:" in message
+    assert "fatal: missing blob abc" in message
     assert "(git printed nothing)" not in message
 
 
-@needs_git
-def test_a_file_absent_from_the_commit_is_still_only_a_skip(tmp_path):
+def test_a_file_absent_from_the_commit_is_still_only_a_skip(tmp_path, monkeypatch):
     """The escalation must stay narrow.
 
     A sparse checkout legitimately lacks whole subtrees the commit never
     carried, and failing on those would break every partial-checkout lane
     instead of catching drift.
     """
-    root, _ = _repo_with_unreadable_blob(tmp_path)
+    monkeypatch.setattr(abi, "run_git", _unreadable_blob_git(tracked=False))
     reasons: dict[str, str] = {}
-    assert abi.read_tracked_source(root / "never_added.hpp", root, reasons) is None
+    assert (
+        abi.read_tracked_source(tmp_path / "never_added.hpp", tmp_path, reasons) is None
+    )
     assert "not tracked at HEAD" in "".join(reasons.values())
 
 
-def test_a_non_checkout_is_a_skip_not_a_failure(tmp_path):
+def test_a_non_checkout_is_a_skip_not_a_failure(tmp_path, monkeypatch):
     """Source tarballs have no git at all; that is not a broken checkout."""
+    monkeypatch.setattr(
+        abi,
+        "run_git",
+        lambda root, *args: _completed(
+            128,
+            stderr=b"fatal: not a git repository (or any of the parent directories)",
+        ),
+    )
     reasons: dict[str, str] = {}
     assert abi.read_tracked_source(tmp_path / "absent.hpp", tmp_path, reasons) is None
     assert "not a git checkout" in "".join(reasons.values())
+
+
+def test_run_git_strips_an_ambient_git_environment(tmp_path, monkeypatch):
+    """Stands in for the pre-commit hook this runs as, which exports GIT_DIR.
+
+    Left in place, GIT_DIR outranks -C and every read answers from the repository
+    that invoked the hook, so a file absent from the tree under test is reported on
+    some other tree's contents -- and the answer looks ordinary either way.
+    """
+    monkeypatch.setenv("GIT_DIR", "/nowhere/.git")
+    monkeypatch.setenv("GIT_WORK_TREE", "/nowhere")
+    monkeypatch.setenv("GIT_INDEX_FILE", "/nowhere/index")
+
+    seen: dict[str, object] = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["cmd"] = cmd
+        seen["env"] = kwargs["env"]
+        return _completed()
+
+    monkeypatch.setattr(abi.subprocess, "run", fake_run)
+    abi.run_git(tmp_path, "cat-file", "-p", "HEAD:x")
+
+    assert [key for key in seen["env"] if key.startswith("GIT_")] == []
+    assert seen["cmd"][:3] == ["git", "-C", str(tmp_path)]
 
 
 # --------------------------------------------------------------------------
@@ -603,6 +635,41 @@ def test_a_clean_include_tree_passes(tmp_path):
     assert abi.check_installed_headers(str(root), []) is True
 
 
+def test_an_include_tree_with_no_headers_is_an_error(tmp_path):
+    """A tree that stages nothing this recognises never got checked, so passing it
+    would report a clean include tree having read no files at all."""
+    root = staged(tmp_path, {"miopen/miopen-config.cmake": "# miopenFoo_impl\n"})
+    with pytest.raises(abi.AbiError, match="nothing was checked"):
+        abi.check_installed_headers(str(root), [])
+
+
+def test_an_include_tree_with_no_miopen_headers_is_an_error(tmp_path):
+    """Headers from other packages sharing the prefix do not count: passing on them
+    would report MIOpen's headers clean having read none of them."""
+    root = staged(tmp_path, {"hip/hip_runtime.h": "void hipFoo(void);\n"})
+    with pytest.raises(abi.AbiError, match="nothing was checked"):
+        abi.check_installed_headers(str(root), [])
+
+
+def test_other_packages_headers_are_still_scanned_for_leaks(tmp_path, capsys):
+    root = staged(
+        tmp_path,
+        {
+            "miopen/miopen.h": "miopenStatus_t miopenFoo(int);\n",
+            "other/leak.h": "miopenStatus_t miopenFoo_impl(int);\n",
+        },
+    )
+    assert abi.check_installed_headers(str(root), []) is False
+    assert "other/leak.h:1: miopenFoo_impl" in capsys.readouterr().out
+
+
+def test_an_include_tree_exempt_all_the_way_down_is_an_error(tmp_path):
+    """Exempting every staged header leaves the same nothing-was-read result."""
+    root = staged(tmp_path, {"miopen/private/rename.hpp": "void miopenFoo_impl();\n"})
+    with pytest.raises(abi.AbiError, match="nothing was checked"):
+        abi.check_installed_headers(str(root), ["miopen/private"])
+
+
 def test_a_leaked_rename_is_reported_with_file_and_line(tmp_path, capsys):
     root = staged(
         tmp_path,
@@ -614,10 +681,17 @@ def test_a_leaked_rename_is_reported_with_file_and_line(tmp_path, capsys):
 
 
 def test_the_private_directory_is_exempt(tmp_path):
-    """The private declarations spell the private names by definition."""
+    """The private declarations spell the private names by definition.
+
+    A public header is staged alongside so the exemption is what carries the pass;
+    without one the tree scans nothing, which is its own failure.
+    """
     root = staged(
         tmp_path,
-        {"miopen/private/miopen_impl.h": "miopenStatus_t miopenFoo_impl(int);\n"},
+        {
+            "miopen/miopen.h": "miopenStatus_t miopenFoo(int);\n",
+            "miopen/private/miopen_impl.h": "miopenStatus_t miopenFoo_impl(int);\n",
+        },
     )
     assert abi.check_installed_headers(str(root), ["miopen/private"]) is True
 
@@ -791,3 +865,102 @@ def test_private_symbols_that_were_never_renamed_are_not_required():
     wrapper = wrapper_elf(symbols=("miopenFoo",))
     private = private_elf(symbols=("miopenFoo_impl", "miopenInternalThing"))
     assert abi.check_impl_superset(wrapper, private) is True
+
+
+def test_a_private_library_with_no_renamed_symbols_is_an_error():
+    """Zero renamed entry points means the wrong file -- --private-lib aimed at the
+    wrapper, or a build where the rename was never applied -- not a satisfied
+    superset."""
+    wrapper = wrapper_elf(symbols=("miopenFoo",))
+    private = private_elf(symbols=("miopenInternalThing",))
+    with pytest.raises(abi.AbiError, match="not a flag-on private library"):
+        abi.check_impl_superset(wrapper, private)
+
+
+# --------------------------------------------------------------------------
+# Exit codes
+#
+# Each check above returning False is only half the contract; the other half is
+# that the subcommand folds it into its exit status. Dropping one `ok &=` would
+# leave every test above passing while the gate ignored that check entirely.
+# 0 is pass, 1 is a check that failed, 2 is a check that could not run.
+# --------------------------------------------------------------------------
+
+
+def run_check_wrapper(tmp_path, monkeypatch, wrapper, private):
+    """Run `check-wrapper` through main() against stand-ins for the two libraries."""
+    baseline = tmp_path / "public_symbols.baseline"
+    baseline.write_text("miopenFoo\nmiopenBar\nmiopenExcluded\n")
+    excluded = tmp_path / "excluded_symbols.txt"
+    excluded.write_text("miopenExcluded\n")
+    libs = {"libMIOpen.so": wrapper, "libMIOpen_private.so": private}
+    monkeypatch.setattr(abi, "open_elf", lambda path, what: libs[path])
+    return abi.main(
+        [
+            "check-wrapper",
+            "libMIOpen.so",
+            "--baseline",
+            str(baseline),
+            "--excluded",
+            str(excluded),
+            "--private-lib",
+            "libMIOpen_private.so",
+        ]
+    )
+
+
+def good_wrapper(**overrides):
+    return wrapper_elf(**{"symbols": ("miopenFoo", "miopenBar"), **overrides})
+
+
+def good_private(**overrides):
+    symbols = ("miopenFoo_impl", "miopenBar_impl", "miopenExcluded")
+    return private_elf(**{"symbols": symbols, **overrides})
+
+
+def test_check_wrapper_passes_a_consistent_pair(tmp_path, monkeypatch, capsys):
+    assert run_check_wrapper(tmp_path, monkeypatch, good_wrapper(), good_private()) == 0
+    assert "wrapper public-abi symbol check: PASS" in capsys.readouterr().out
+
+
+def test_check_wrapper_fails_on_a_coversion_mismatch(tmp_path, monkeypatch, capsys):
+    private = good_private(soname="libMIOpen_private.so.2")
+    assert run_check_wrapper(tmp_path, monkeypatch, good_wrapper(), private) == 1
+    assert "wrapper public-abi symbol check: FAIL" in capsys.readouterr().out
+
+
+def test_check_wrapper_fails_on_a_missing_stub(tmp_path, monkeypatch, capsys):
+    private = good_private(
+        symbols=("miopenFoo_impl", "miopenBar_impl", "miopenBaz_impl", "miopenExcluded")
+    )
+    assert run_check_wrapper(tmp_path, monkeypatch, good_wrapper(), private) == 1
+    assert "wrapper public-abi symbol check: FAIL" in capsys.readouterr().out
+
+
+def test_check_wrapper_that_cannot_run_exits_2(tmp_path, monkeypatch, capsys):
+    # A private library with no renamed symbols makes the superset check raise.
+    private = good_private(symbols=("miopenExcluded",))
+    assert run_check_wrapper(tmp_path, monkeypatch, good_wrapper(), private) == 2
+    assert "not a flag-on private library" in capsys.readouterr().err
+
+
+def test_check_installed_headers_exempts_the_private_directory_by_default(tmp_path):
+    root = staged(
+        tmp_path,
+        {
+            "miopen/miopen.h": "miopenStatus_t miopenFoo(void);\n",
+            "miopen/private/miopen_impl.h": "miopenStatus_t miopenFoo_impl(void);\n",
+        },
+    )
+    assert abi.main(["check-installed-headers", str(root)]) == 0
+
+
+def test_check_installed_headers_fails_on_a_leak(tmp_path):
+    root = staged(
+        tmp_path, {"miopen/miopen.h": "miopenStatus_t miopenFoo_impl(void);\n"}
+    )
+    assert abi.main(["check-installed-headers", str(root)]) == 1
+
+
+def test_check_installed_headers_that_cannot_run_exits_2(tmp_path):
+    assert abi.main(["check-installed-headers", str(tmp_path / "missing")]) == 2

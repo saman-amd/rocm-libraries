@@ -9,7 +9,7 @@ suffix). `check_names.py` enforces that schema against `miopen_gtest --gtest_lis
 A test belongs to the hipDNN backend-swap surface if its full gtest name contains the
 token `HipdnnShim`. Parameterized tests get it from the instantiation prefix, e.g.
 `INSTANTIATE_TEST_SUITE_P(HipdnnShim, GPU_ConvFwdApi_FP32, ...)`. Non-parameterized tests
-carry it directly in the suite name instead, e.g. `TEST(GPU_HipdnnShimConvFwdApi_FP32, ...)`,
+carry it directly in the suite name instead, e.g. `TEST_F(GPU_HipdnnShimConvFwdApi_FP32, ...)`,
 since `check_names.py`'s prefix check only applies to the `Smoke`/`Standard`/`Full`/`Perf`/
 `Unit` token used by parameterized instantiations.
 
@@ -21,28 +21,7 @@ Select the surface with `--gtest_filter='*HipdnnShim*'`. That filter is what the
 `=enabled`; a test outside the surface is never replayed, and a test inside it that is not
 reachable through public entry points makes the comparison meaningless.
 
-### Configuring a build that runs the parity entries
-
-The parity entries exist in any build configured with `-DMIOPEN_ENABLE_HIPDNN_WRAPPER=ON` on a
-GPU node. `MIOPEN_TEST_DISCRETE` does not matter: CMake scans the test sources for the
-`HipdnnShim` token and registers a parity entry for each executable that holds one, so a
-discrete build replays `test_hipdnn_shim_conv` and a single-binary build replays
-`miopen_gtest`. Configure prints which binaries it registered.
-
-The two things that do suppress the entries are no GPU (`MIOPEN_NO_GPU`, since the shim
-surface is all `*GPU*` tests) and no source carrying the token. Both are reported at configure
-time, because the failure is otherwise silent: with nothing registered, `ctest -L
-forwarding_parity` selects nothing and reports success. A CI job that is supposed to enforce
-parity should still assert that `ctest -N -L forwarding_parity` lists a non-zero number of
-tests, rather than trusting a green run that selected none.
-
-One asymmetry remains in packaged artifacts. The mirrored entry written into the installed
-`CTestTestfile.cmake` is single-binary only, because packaging installs one test executable and
-it is `miopen_gtest`. That costs nothing in practice — the builds that produce artifacts
-already configure with `-DMIOPEN_TEST_DISCRETE=OFF`, which packaged dbsync and the categorized
-test list need anyway — but a discrete build tests parity in its build tree only.
-
-Two consequences of the parity entries being the intended path, both easy to "fix" in the wrong
+Two consequences of that being the only entry path, both easy to "fix" in the wrong
 direction:
 
 - **Shim-surface tests stay out of `test_categories.yaml` on purpose.** The categorized
@@ -62,6 +41,66 @@ To qualify, a shim-surface test must:
    bit-reproducibility.
 
 See `hipdnn_shim_conv.cpp` for worked examples.
+
+## Forwarding parity harness
+
+With `MIOPEN_ENABLE_HIPDNN_WRAPPER=ON`, each `*_forwarding_parity` ctest entry runs
+`script/run_forwarding_parity.py`. It replays the shim surface twice, once with
+`MIOPEN_HIPDNN_FORWARDING=disabled` and once with `=enabled`, and requires the two runs to
+agree test for test. The runs can differ only for entry points listed in
+`kForwardingEntries` in `src/private/routing.cpp`, so a shim test that reaches an entry point
+outside that list runs the same code twice and checks nothing.
+
+Why it is set up this way:
+
+- **Only the shim surface is replayed.** The rest of the suite reaches compute through
+  internal headers that bypass the wrapper, so replaying it would cost two full runs to prove
+  nothing, and any flaky test in it would look like a real divergence.
+- **One ctest entry, not three tied together by a fixture.** A sharded ctest run hands out
+  whole entries, so the members of a fixture can land in different shards and fail there as
+  unsatisfied. The script runs the two replays and the comparison itself, and stops before the
+  comparison if a replay fails.
+- **The gtest shard variables are pinned to one shard.** A sharded CI run exports
+  `GTEST_TOTAL_SHARDS`/`GTEST_SHARD_INDEX`, and a replay that honoured them would compare only
+  one shard's slice of the shim surface, with no other entry covering the rest.
+- **One bare entry plus one per `ex_gpu_*` label.** CI selects tests by a tier label combined
+  with an architecture filter, either `-L ^ex_gpu_<arch>$` on an architecture that
+  `test_categories.yaml` declares or `-LE ex_gpu` elsewhere. No single entry survives both, so
+  exactly one of these is selected under each. `ForwardingParityGpuLabels.cmake` takes the
+  labels from the shared parser's output, so an architecture gets a parity entry exactly when
+  the parser registers an enabled test for it, and stops the configure if the parser fails.
+  `forwarding_parity` goes on the bare entry only, so `ctest -L forwarding_parity` replays the
+  surface once.
+- **Tier labels are `quick`, `standard`, `comprehensive` and `full`,** so the harness runs in
+  every tier lane. Not `ffm-quick`/`ffm-full`: those run a fixed list of patterns on a tight
+  time budget.
+- **In a discrete build, only `test_hipdnn_shim_conv` gets an entry.** Any other binary would
+  replay a filter that matches nothing, and the comparison rejects two empty runs.
+- **No build-tree entry without a GPU.** The shim tests are all `GPU_` tests.
+
+The packaged test list (`bin/MIOpen/CTestTestfile.cmake`) is generated from
+`test_categories.yaml` and does not see `add_test()` calls, so the harness entries and
+`wrapper_abi_check` are written into it separately. Without that, `ctest -L forwarding_parity`
+on a packaged build would select nothing and pass. The packaged entries are not tied to
+`MIOPEN_NO_GPU`, which describes the build machine; packages are often built without a GPU and
+tested elsewhere. Only the single-binary build (`MIOPEN_TEST_DISCRETE=OFF`) ships them.
+
+`wrapper_abi_check` (`script/check_wrapper_abi.py`) checks the wrapper's exported ABI from the
+two built libraries. It also compares the wrapper's list of required shared libraries
+(`DT_NEEDED`) with `test/public_abi/wrapper_needed.baseline`, which keeps the hipDNN backend
+opened on first use rather than required at load time. It loads neither library, so it needs
+no GPU and is registered whenever the flag is on. The packaged copy leaves out `--public-header`, which compares two source files that
+the build-tree entry already checks.
+
+`test_forwarding_parity_scripts` tests the harness scripts themselves. It needs no GPU or
+build output, so it carries only the tier labels. It uses `unittest` rather than `pytest`,
+because nothing installs `pytest` on a machine that builds MIOpen.
+
+Two cache variables tune the harness:
+
+- `MIOPEN_FORWARDING_PARITY_FILTER` (default `*HipdnnShim*`): the gtest filter replayed.
+- `MIOPEN_FORWARDING_PARITY_TIMEOUT` (default `3600`): seconds per entry, covering both
+  replays and the comparison.
 
 ### Saying more than pass or fail
 
@@ -89,5 +128,6 @@ Two rules make the list safe to have:
   line, so a known divergence never reads as a clean pass.
 
 To add one, run the harness, copy the failing line's test name and both outcomes into the
-file, and write down the reason. To check the list itself, run
-`python -m pytest script/test_compare_forwarding_runs.py`, which needs no build or GPU.
+file, and write down the reason. The list's own rules are covered by
+`test_forwarding_parity_scripts`, or by hand with
+`python3 -m unittest test_compare_forwarding_runs` from `script/`; neither needs a build or GPU.

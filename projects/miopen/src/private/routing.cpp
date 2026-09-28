@@ -33,10 +33,9 @@ const char* const kTraceLogLevel = "6";
 // Entry points redirected to hipDNN when forwarding is enabled. To add one, list
 // it here and bump the array size.
 //
-// This array is where the forwarding parity harness gets its signal. That harness
-// (the *_forwarding_parity ctest entry, driven by script/run_forwarding_parity.py)
-// runs the shim tests twice, once with MIOPEN_HIPDNN_FORWARDING=disabled and once
-// with =enabled, and requires the two runs to agree.
+// The forwarding parity tests (script/run_forwarding_parity.py) run the shim
+// tests once with forwarding disabled and once enabled and require the two runs
+// to agree, so every name listed here is checked against the MIOpen path.
 //
 // The bias entry points (miopenConvolutionForwardBias, miopenConvolutionBackwardBias)
 // are deliberately absent: they are standalone bias kernels rather than
