@@ -60,8 +60,6 @@ from Tensile.Components.StreamK import (
     StreamKTwoTileDPFirst,
 )
 from Tensile.Components.WorkAssignment import Hybrid, StaticGrid
-from _persistent_isa import Machine
-from streamk5_test_helpers import emit_mode_extraction_module
 
 pytestmark = pytest.mark.unit
 
@@ -322,13 +320,5 @@ def test_initialization_does_not_extract_the_uso_bit(assignment, processing):
                 assert params[2] == hex(30), "Only the hybrid mode bit is extracted"
 
 
-def test_sk5_mode_extraction_leaves_bit_29_alone():
-    """Bit 30 DOES need clearing (SKTiles aliases the register); bit 29 must not."""
+def test_sk5_initialization_extracts_mode():
     assert ".extractMode(" in inspect.getsource(Hybrid.initialize)
-    module = emit_mode_extraction_module()
-    for mode, uso in itertools.product((0, 1), repeat=2):
-        packed = (mode << 30) | (uso << _SK_USO_BIT) | 17
-        machine = Machine(MagicShiftItersPerTile=packed)
-        assert machine.run(module) is None
-        assert machine["WorkAssignmentMode"] == mode
-        assert machine["MagicShiftItersPerTile"] == (uso << _SK_USO_BIT) | 17

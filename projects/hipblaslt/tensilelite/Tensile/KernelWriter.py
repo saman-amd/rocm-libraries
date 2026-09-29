@@ -5648,17 +5648,6 @@ class KernelWriter(PersistentKernelState, metaclass=abc.ABCMeta):
 
 
   ##############################################################################
-  # StreamK Constants In VGPRs
-  ##############################################################################
-
-
-
-
-  ##############################################################################
-  # Move StreamK Constants to VGPRs
-  ##############################################################################
-
-  ##############################################################################
   # Persistent Compute Section
   #
   # Everything one persistent iteration does before the store: new-tile setup,

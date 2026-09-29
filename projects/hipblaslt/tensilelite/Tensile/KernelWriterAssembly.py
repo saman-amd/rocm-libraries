@@ -19136,17 +19136,6 @@ class KernelWriterAssembly(KernelWriter):
     return module
 
   ##############################################################################
-  # PAP tile-identity group.
-  #
-  # The StreamK PAP handoff maps WorkGroup*/StreamKLocal* to the next
-  # persistent tile to compute next-tile addresses, but current NLL/tail code
-  # resumes immediately after the prefetch. Keep tile identity borrowed.
-  ##############################################################################
-
-
-
-
-  ##############################################################################
   # Prefetch across persistent: prefetch next tile's data during the NLL.
   #
   # Durable output from this sequence is limited to the issued first-PGR loads,
