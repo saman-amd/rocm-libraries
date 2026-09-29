@@ -20,20 +20,12 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
 
-from typing import Optional, OrderedDict, Callable
 import sys
 import os
 
 sys.path.append(f"{os.path.dirname(__file__)}/../")
 
-from utils import TYPE_CONFIGS
-from tuner.base_tuner import BaseTuner, TunerArgs, COMMON_KEY_TYPES
-
-"""
-Inclusive range for params tuning, edit these to adjust tuning grid range.
-"""
-BLOCK_SIZES = [32, 64, 128, 256, 512, 1024, 2048]
-GRID_SIZES = [32, 64, 128, 256, 512, 1024]
+from tuner.base_tuner import BaseTuner, TunerArgs
 
 class Tuner(BaseTuner):
     @classmethod
@@ -42,22 +34,6 @@ class Tuner(BaseTuner):
 
     def __init__(self, args: TunerArgs) -> None:
         super().__init__(args)
-
-    def _get_tune_params(self) -> OrderedDict:
-        params = OrderedDict()
-        params['block_size_x'] = BLOCK_SIZES
-        params['grid_size'] = GRID_SIZES
-        return params
-
-    def _get_restrictions(self) -> Callable[[dict], bool]:
-        min_total_threads = 32768
-        def validate(params):
-            threads = params['block_size_x']
-            blocks = params['grid_size']
-
-            return threads * blocks >= min_total_threads
-
-        return validate
 
 if __name__ == "__main__":
     Tuner.cli()
