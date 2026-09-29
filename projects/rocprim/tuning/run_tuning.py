@@ -154,7 +154,7 @@ def run_tuning(
                         seed=seed,
                     )
                     tuner = tuning_module.Tuner(args)
-                    tuner.tune_all()
+                    tuner.tune()
                 else:
                     print(f"Warning: No tuner class found in {algo} module")
             except Exception:
