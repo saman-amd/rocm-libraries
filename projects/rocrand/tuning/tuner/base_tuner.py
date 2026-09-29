@@ -434,4 +434,5 @@ class BaseTuner(ABC):
             "-Wno-#pragma-messages",
             f"--offload-arch={self.arch_name}",
             "-lamd_smi",
+            "-lrocrand",
         ]

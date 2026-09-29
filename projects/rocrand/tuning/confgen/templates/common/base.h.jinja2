@@ -47,6 +47,7 @@ struct generator_config_selector<ROCRAND_RNG_PSEUDO_{{algo_name|upper}}, T>
             {% for key, value in targets.items() %}
             case target_arch::{{key}}: return {{value.tune_params.block_size_x}};
             {% endfor %}
+            default: return generator_config_defaults<ROCRAND_RNG_PSEUDO_{{algo_name|upper}}, T>::threads;
         }
     }
 
@@ -58,6 +59,7 @@ struct generator_config_selector<ROCRAND_RNG_PSEUDO_{{algo_name|upper}}, T>
             {% for key, value in targets.items() %}
             case target_arch::{{key}}: return {{value.tune_params.grid_size}};
             {% endfor %}
+            default: return generator_config_defaults<ROCRAND_RNG_PSEUDO_{{algo_name|upper}}, T>::blocks;
         }
     }
 };
