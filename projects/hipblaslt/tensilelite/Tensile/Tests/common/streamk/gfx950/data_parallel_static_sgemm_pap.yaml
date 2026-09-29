@@ -56,8 +56,7 @@ BenchmarkProblems:
         - Use64bShadowLimit: [False]
       BenchmarkFinalParameters:
         - ProblemSizes:
-          # With TENSILE_STREAMK_FIXED_GRID=7 these cover fewer/equal/more
-          # tiles than workgroups, a nonmultiple, batches, tails, and zero K.
+          # Single-pass cases, batches, tails, and zero K.
           - Exact: [128, 128, 1, 16]
           - Exact: [128, 896, 1, 32]
           - Exact: [128, 1024, 1, 64]
@@ -65,3 +64,7 @@ BenchmarkProblems:
           - Exact: [257, 385, 2, 129]
           - Exact: [129, 257, 2, 0]
           - Exact: [4096, 2048, 1, 512]
+          # Default grid selection: excess workgroups for a single large-K tile.
+          - Exact: [128, 128, 1, 8192]
+          # Multiple persistent iterations, uneven exhaustion, batches, and M/N/K edges.
+          - Exact: [4097, 4097, 3, 257]
