@@ -30,10 +30,10 @@ from typing import List, Optional
 from contextlib import contextmanager
 import re
 import traceback
-from utils import Parser
+from utils import Parser, BASE_DIR
+from glob import glob
 
 from tuner.base_tuner import TunerArgs
-
 
 @contextmanager
 def working_directory(path: Path):
@@ -64,10 +64,7 @@ def import_module_from_file(file_path: str, module_name: str) -> Optional[Module
 
 def get_available_algorithms() -> List[str]:
     """Return list of supported tuning algorithms."""
-    return sorted([
-        "lfsr113",
-        # Add new algorithms here
-    ])
+    return sorted([re.sub(r'^tuning_|\.py', '', os.path.basename(f)) for f in glob(f'{BASE_DIR}/tuner/tuning_*')])
 
 def filter_algorithms(available_algos: List[str], pattern: str) -> List[str]:
     """Filter algorithms based on regex pattern."""

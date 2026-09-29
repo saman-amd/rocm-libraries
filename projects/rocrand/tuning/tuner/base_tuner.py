@@ -84,24 +84,11 @@ Kernel Tuner documentation: https://kerneltuner.github.io/kernel_tuner/stable/co
 ROCm HIP Python Wrapper: https://rocm.docs.amd.com/projects/hip-python/en/latest/index.html
 """
 
-COMMON_KEY_TYPES = [
-    "rocprim::int128_t",
-    "int64_t",
-    "int",
-    "short",
-    "int8_t",
-    "double",
-    "float",
-    "rocprim::half",
-]
-COMMON_VALUE_TYPES = [
-    "rocprim::int128_t",
-    "int64_t",
-    "int",
-    "short",
-    "int8_t",
-]
-
+"""
+Inclusive range for params tuning, edit these to adjust tuning grid range.
+"""
+BLOCK_SIZES = [32, 64, 128, 256, 512, 1024, 2048]
+GRID_SIZES = [32, 64, 128, 256, 512, 1024]
 
 @dataclass
 class TunerArgs:
@@ -198,14 +185,13 @@ class BaseTuner(ABC):
         )
         defaults.update_with_kwargs(**args)
         cls(defaults).tune()
-
-    @abstractmethod
+    
     def _get_tune_params(self) -> OrderedDict:
-        """Returns tuning parameters and their possible values as an OrderedDict.
-        Each parameter maps to a list of valid values to explore during tuning."""
-        pass
+        params = OrderedDict()
+        params['block_size_x'] = BLOCK_SIZES
+        params['grid_size'] = GRID_SIZES
+        return params
 
-    @abstractmethod
     def _get_restrictions(self) -> Callable[[dict], bool] | List[str]:
         """Define constraints for what parameter combinations are valid during tuning.
 
@@ -221,6 +207,15 @@ class BaseTuner(ABC):
             See Kernel Tuner's documentation for more details
         """
         pass
+
+        min_total_threads = 32768
+        def validate(params):
+            threads = params['block_size_x']
+            blocks = params['grid_size']
+
+            return threads * blocks >= min_total_threads
+
+        return validate
 
     def _get_grid_div_x(self):
         """Return the grid_div_x parameter for kernel_tuner.tune_kernel()"""
