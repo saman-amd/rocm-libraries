@@ -7,7 +7,6 @@
 #include <stdexcept>
 
 #include <hipdnn_flatbuffers_sdk/flatbuffer_utilities/GraphWrapper.hpp>
-#include <hipdnn_flatbuffers_sdk/utilities/ApplicabilityUtils.hpp>
 
 namespace hipdnn_integration_tests::bundle
 {
@@ -46,39 +45,6 @@ const std::set<NodeAttributes>& gpuSupportedOps()
         NodeAttributes::SdpaAttributes,
     };
     return s_ops;
-}
-
-// No reference executor supports ragged or per-batch seq-len tensors yet.
-bool usesUnsupportedGraphFeatures(const void* graphBuffer, size_t size)
-{
-    try
-    {
-        auto graph = hipdnn_flatbuffers_sdk::flatbuffer_utilities::GraphWrapper::fromSerializedBlob(
-            graphBuffer, size);
-        if(!hipdnn_flatbuffers_sdk::utilities::hasNoRaggedTensorIds(graph.getTensorMap()))
-        {
-            return true;
-        }
-        const auto setsSeqLen = [](const auto* attributes) {
-            return attributes != nullptr
-                   && (attributes->seq_len_q_tensor_uid().has_value()
-                       || attributes->seq_len_kv_tensor_uid().has_value());
-        };
-        for(uint32_t i = 0; i < graph.nodeCount(); ++i)
-        {
-            const auto& node = graph.getNode(i);
-            if(setsSeqLen(node.attributes_as_SdpaAttributes())
-               || setsSeqLen(node.attributes_as_SdpaBackwardAttributes()))
-            {
-                return true;
-            }
-        }
-        return false;
-    }
-    catch(const std::exception&)
-    {
-        return true;
-    }
 }
 
 } // namespace
@@ -127,10 +93,22 @@ bool referenceCoversGraph(ReferenceExecutorType type, const void* graphBuffer, s
     }
 
     const auto& supported = referenceSupportedOps(type);
-    return std::all_of(types->begin(),
-                       types->end(),
-                       [&supported](const auto nodeType) { return supported.count(nodeType) != 0; })
-           && !usesUnsupportedGraphFeatures(graphBuffer, size);
+    return std::all_of(types->begin(), types->end(), [&supported](const auto nodeType) {
+        return supported.count(nodeType) != 0;
+    });
+}
+
+bool referenceVerificationEnabled(ReferenceExecutorType type, const BundleMetadata& metadata)
+{
+    switch(type)
+    {
+    case ReferenceExecutorType::CPU:
+        return metadata.referenceVerification.cpu;
+    case ReferenceExecutorType::GPU:
+        return metadata.referenceVerification.gpu;
+    default:
+        throw std::runtime_error("Unknown reference executor type");
+    }
 }
 
 std::vector<std::string>

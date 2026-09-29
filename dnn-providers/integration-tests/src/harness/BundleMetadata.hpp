@@ -30,6 +30,14 @@ enum class EnforcementLevel
     FULL ///< engine must additionally execute and numeric-verify (default)
 };
 
+/// Which reference executors the golden-data harness validates a bundle against.
+/// A disabled reference is instead required to report the graph inapplicable.
+struct ReferenceVerification
+{
+    bool cpu = true;
+    bool gpu = true;
+};
+
 /// Metadata read from a {Name}.meta.json companion file alongside a golden
 /// reference bundle ({Name}.json + {Name}.tensor{uid}.bin).
 ///
@@ -55,6 +63,7 @@ struct BundleMetadata
     std::optional<int64_t> minimumVramMb;
     std::optional<std::unordered_map<int64_t, nlohmann::json>> inputs;
     EnforcementLevel enforcementLevel = EnforcementLevel::FULL;
+    ReferenceVerification referenceVerification;
 };
 
 // ---------------------------------------------------------------------------
@@ -170,6 +179,41 @@ inline std::optional<BundleMetadata> parseBundleMetadataJson(const nlohmann::jso
         {
             HIPDNN_SDK_LOG_WARN((source.empty() ? std::string("Metadata") : std::string(source))
                                 << " has invalid enforcement_level \"" << level << "\"");
+            return std::nullopt;
+        }
+    }
+
+    // Strict for the same reason as enforcement_level: a malformed flag must not
+    // silently re-enable or disable a reference.
+    if(json.contains("reference_verification"))
+    {
+        const auto& verification = json["reference_verification"];
+        if(!verification.is_object())
+        {
+            HIPDNN_SDK_LOG_WARN((source.empty() ? std::string("Metadata") : std::string(source))
+                                << " has invalid reference_verification (expected an object)");
+            return std::nullopt;
+        }
+
+        auto readFlag = [&](const char* key, bool& enabled) {
+            if(!verification.contains(key))
+            {
+                return true;
+            }
+            if(!verification[key].is_boolean())
+            {
+                HIPDNN_SDK_LOG_WARN((source.empty() ? std::string("Metadata") : std::string(source))
+                                    << " has invalid reference_verification." << key
+                                    << " (expected a boolean)");
+                return false;
+            }
+            enabled = verification[key].get<bool>();
+            return true;
+        };
+
+        if(!readFlag("cpu", meta.referenceVerification.cpu)
+           || !readFlag("gpu", meta.referenceVerification.gpu))
+        {
             return std::nullopt;
         }
     }

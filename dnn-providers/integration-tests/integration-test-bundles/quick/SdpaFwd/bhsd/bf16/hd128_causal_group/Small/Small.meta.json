@@ -44,5 +44,8 @@
         "layout": "bhsd",
         "ragged": false,
         "ragged_physical_lens": null
+    },
+    "reference_verification": {
+        "gpu": false
     }
 }

@@ -195,6 +195,7 @@ The `.meta.json` file itself is optional for forward bundles. A bundle without o
 | `notes` | No | string | Free-text notes for humans. |
 | `seed` | No | integer | RNG seed used for input generation. Enables reproducible regeneration. |
 | `minimum_vram_mb` | No | integer | Minimum device VRAM in MB required to run this bundle. The runner skips the test if the device has less. |
+| `reference_verification` | No | object | Which reference executors golden-data validation runs against: `{"cpu": bool, "gpu": bool}`. Each key is optional and defaults to `true`. A reference set to `false` is not run; instead its test asserts that the reference's `isApplicable()` rejects the graph, so a reference that gains support flags the stale entry. A value that is not an object, or a key that is not a boolean, rejects the metadata. |
 
 Unknown fields are ignored by the reader, so generators may include additional fields without breaking compatibility.
 

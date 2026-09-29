@@ -283,6 +283,87 @@ TEST_F(TestBundleReferenceValidationHarness, ReferenceThatThrowsIsReportedWithIt
               std::string::npos);
 }
 
+// reference_verification disabling a reference turns the test into a check that
+// the reference declines the graph. Nothing executes, so golden data is optional.
+TEST_F(TestBundleReferenceValidationHarness, DisabledReferenceThatDeclinesPasses)
+{
+    ON_CALL(_gpuExecutor, isApplicable(::testing::_, ::testing::_))
+        .WillByDefault(::testing::Return(false));
+    EXPECT_CALL(_gpuExecutor, execute(::testing::_, ::testing::_, ::testing::_)).Times(0);
+
+    auto bundle = fixtures::loadBundle(_tempDir, "Bundle", /*includeGoldenOutput=*/false);
+    bundle->metadata.referenceVerification.gpu = false;
+    BundleReferenceValidationHarness harness(
+        ReferenceExecutorType::GPU, /*requiresDevice=*/false, executors());
+    harness.setBundle(bundle, _tempDir / "Bundle");
+
+    ::testing::TestPartResultArray results;
+    drive(harness, &results);
+
+    EXPECT_FALSE(testing_support::anyFailed(results)) << testing_support::allMessages(results);
+    EXPECT_FALSE(testing_support::anySkipped(results));
+}
+
+// A reference that accepts a graph its bundle says it cannot run means the flag is
+// stale: the reference grew support and the bundle should be validated again.
+TEST_F(TestBundleReferenceValidationHarness, DisabledReferenceThatAcceptsFails)
+{
+    EXPECT_CALL(_gpuExecutor, execute(::testing::_, ::testing::_, ::testing::_)).Times(0);
+
+    auto bundle = fixtures::loadBundle(_tempDir, "Bundle", /*includeGoldenOutput=*/true);
+    bundle->metadata.referenceVerification.gpu = false;
+    BundleReferenceValidationHarness harness(
+        ReferenceExecutorType::GPU, /*requiresDevice=*/false, executors());
+    harness.setBundle(bundle, _tempDir / "Bundle");
+
+    ::testing::TestPartResultArray results;
+    drive(harness, &results);
+
+    EXPECT_TRUE(testing_support::anyFailed(results));
+    EXPECT_NE(testing_support::allMessages(results).find("reference_verification disables"),
+              std::string::npos)
+        << testing_support::allMessages(results);
+}
+
+TEST_F(TestBundleReferenceValidationHarness, DisabledReferenceThatThrowsFails)
+{
+    ON_CALL(_gpuExecutor, isApplicable(::testing::_, ::testing::_))
+        .WillByDefault([](void*, size_t) -> bool {
+            throw std::runtime_error("stub: applicability exploded");
+        });
+
+    auto bundle = fixtures::loadBundle(_tempDir, "Bundle", /*includeGoldenOutput=*/false);
+    bundle->metadata.referenceVerification.gpu = false;
+    BundleReferenceValidationHarness harness(
+        ReferenceExecutorType::GPU, /*requiresDevice=*/false, executors());
+    harness.setBundle(bundle, _tempDir / "Bundle");
+
+    ::testing::TestPartResultArray results;
+    drive(harness, &results);
+
+    EXPECT_TRUE(testing_support::anyFailed(results));
+    EXPECT_NE(testing_support::allMessages(results).find("stub: applicability exploded"),
+              std::string::npos)
+        << testing_support::allMessages(results);
+}
+
+// Only the reference named in the flag changes behaviour; the other still requires
+// golden data like any registered bundle.
+TEST_F(TestBundleReferenceValidationHarness, DisablingOneReferenceLeavesTheOtherGated)
+{
+    auto bundle = fixtures::loadBundle(_tempDir, "Bundle", /*includeGoldenOutput=*/false);
+    bundle->metadata.referenceVerification.gpu = false;
+    BundleReferenceValidationHarness harness(
+        ReferenceExecutorType::CPU, /*requiresDevice=*/false, executors());
+    harness.setBundle(bundle, _tempDir / "Bundle");
+
+    ::testing::TestPartResultArray results;
+    driveSetUp(harness, &results);
+
+    EXPECT_TRUE(testing_support::anyFailed(results));
+    EXPECT_NE(testing_support::allMessages(results).find("no golden data"), std::string::npos);
+}
+
 // The green path, and the mismatch path beside it: a reference whose output equals
 // the golden data passes, and one that drifts fails naming the tensor. Together
 // they pin that the comparison is actually consulted rather than assumed.

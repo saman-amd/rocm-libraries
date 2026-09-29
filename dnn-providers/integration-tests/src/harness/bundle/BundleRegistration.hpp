@@ -209,25 +209,35 @@ inline void registerBundles(const std::vector<LoadedBundle>& bundles,
 //
 // Bundles that fall outside the reference's supported-op set are simply absent from
 // the suite, and the count is logged so the gap is visible rather than silent.
+//
+// Bundles whose metadata disables this reference are registered regardless of golden
+// data or op coverage: their test asserts the reference declines the graph, which
+// needs only the graph.
 inline void registerReferenceValidationTests(const std::vector<LoadedBundle>& bundles,
                                              ReferenceExecutorType referenceType)
 {
     const char* label = BundleReferenceValidationHarness::referenceLabel(referenceType);
 
     size_t registered = 0;
+    size_t expectedInapplicable = 0;
     size_t noGolden = 0;
     size_t uncovered = 0;
     std::set<std::string> uncoveredOps;
 
     for(const auto& bundle : bundles)
     {
-        if(!bundle.bundle->hasGoldenOutputs)
+        if(!referenceVerificationEnabled(referenceType, bundle.bundle->metadata))
+        {
+            expectedInapplicable++;
+        }
+        else if(!bundle.bundle->hasGoldenOutputs)
         {
             noGolden++;
             continue;
         }
-        if(!referenceCoversGraph(
-               referenceType, bundle.bundle->graphBuffer.data(), bundle.bundle->graphBuffer.size()))
+        else if(!referenceCoversGraph(referenceType,
+                                      bundle.bundle->graphBuffer.data(),
+                                      bundle.bundle->graphBuffer.size()))
         {
             uncovered++;
             // Name the ops responsible, not just the tally. The op set is a
@@ -270,9 +280,11 @@ inline void registerReferenceValidationTests(const std::vector<LoadedBundle>& bu
     }
 
     std::cerr << "Golden-data validation (" << label << "): " << registered
-              << " bundle(s) registered, " << noGolden << " without golden data, " << uncovered
-              << " outside this reference's supported-op set or using ragged/seq-len tensors"
-              << formatUncoveredOps(uncoveredOps) << "\n";
+              << " bundle(s) registered (" << expectedInapplicable
+              << " expected inapplicable per reference_verification), " << noGolden
+              << " without golden data, " << uncovered
+              << " outside this reference's supported-op set" << formatUncoveredOps(uncoveredOps)
+              << "\n";
 }
 
 } // namespace detail

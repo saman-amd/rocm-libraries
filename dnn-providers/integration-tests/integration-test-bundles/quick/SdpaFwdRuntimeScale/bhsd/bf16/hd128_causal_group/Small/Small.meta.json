@@ -11,5 +11,8 @@
             "kind": "fixed",
             "value": 2.0
         }
+    },
+    "reference_verification": {
+        "gpu": false
     }
 }

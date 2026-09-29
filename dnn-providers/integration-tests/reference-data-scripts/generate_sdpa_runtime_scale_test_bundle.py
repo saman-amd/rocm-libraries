@@ -272,8 +272,8 @@ def build_graph_json(q_dims, k_dims, v_dims, o_dims, dtype, causal, group, stats
     return graph, scale_uid
 
 
-def build_meta_json(scale_uid, scale_value):
-    return {
+def build_meta_json(scale_uid, scale_value, group=False):
+    meta = {
         "format_version": 1,
         "operation": "SdpaFwdRuntimeScale",
         "generator": "generate_sdpa_runtime_scale_test_bundle.py",
@@ -292,6 +292,11 @@ def build_meta_json(scale_uid, scale_value):
         ),
         "inputs": {str(scale_uid): {"kind": "fixed", "value": scale_value}},
     }
+    # The GPU reference has no per-batch seq-len support; the golden-data harness
+    # asserts it declines these graphs instead of validating against it.
+    if group:
+        meta["reference_verification"] = {"gpu": False}
+    return meta
 
 
 def generate_bundle(
@@ -350,7 +355,7 @@ def generate_bundle(
         f.write("\n")
     print(f"  Graph JSON: {json_path}")
 
-    meta_json = build_meta_json(scale_uid, scale_value)
+    meta_json = build_meta_json(scale_uid, scale_value, group)
     meta_path = f"{base_filename}.meta.json"
     with open(meta_path, "w") as f:
         json.dump(meta_json, f, indent=4)

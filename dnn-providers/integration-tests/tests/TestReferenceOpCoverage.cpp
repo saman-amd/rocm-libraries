@@ -20,6 +20,7 @@
 #include "SdpaFwdGraphTestUtils.hpp"
 #include "harness/bundle/ReferenceOpCoverage.hpp"
 
+using hipdnn_integration_tests::BundleMetadata;
 using hipdnn_integration_tests::ReferenceExecutorType;
 using hipdnn_integration_tests::bundle::formatUncoveredOps;
 using hipdnn_integration_tests::bundle::graphNodeTypes;
@@ -27,6 +28,7 @@ using hipdnn_integration_tests::bundle::K_UNREADABLE_GRAPH;
 using hipdnn_integration_tests::bundle::NodeAttributes;
 using hipdnn_integration_tests::bundle::referenceCoversGraph;
 using hipdnn_integration_tests::bundle::referenceSupportedOps;
+using hipdnn_integration_tests::bundle::referenceVerificationEnabled;
 using hipdnn_integration_tests::bundle::uncoveredNodeTypes;
 using hipdnn_integration_tests::test_utils::markFirstTensorRagged;
 
@@ -162,24 +164,45 @@ TEST(TestReferenceOpCoverage, DeviceReferenceDoesNotCoverBatchnormInference)
     EXPECT_EQ(uncovered.front(), "BatchnormInferenceAttributes");
 }
 
-TEST(TestReferenceOpCoverage, RaggedGraphsAreNotCovered)
+// Coverage is decided by op type alone. Graph features a reference cannot handle
+// are declared per bundle through reference_verification, which the harness then
+// checks against isApplicable() rather than silently dropping the bundle.
+TEST(TestReferenceOpCoverage, RaggedAndSeqLenGraphsAreCoveredByOpType)
 {
     auto dense = buildSdpaGraph();
     auto ragged = markFirstTensorRagged(dense.GetBufferPointer());
 
+    hipdnn_flatbuffers_sdk::data_objects::SdpaAttributesT seqLenAttrs;
+    seqLenAttrs.seq_len_kv_tensor_uid = 4;
+    auto seqLen = buildSdpaGraph(seqLenAttrs);
+
+    EXPECT_TRUE(referenceCoversGraph(ReferenceExecutorType::GPU, ragged.data(), ragged.size()));
     EXPECT_TRUE(referenceCoversGraph(
-        ReferenceExecutorType::GPU, dense.GetBufferPointer(), dense.GetSize()));
-    EXPECT_FALSE(referenceCoversGraph(ReferenceExecutorType::GPU, ragged.data(), ragged.size()));
+        ReferenceExecutorType::GPU, seqLen.GetBufferPointer(), seqLen.GetSize()));
 }
 
-TEST(TestReferenceOpCoverage, SeqLenGraphsAreNotCovered)
-{
-    hipdnn_flatbuffers_sdk::data_objects::SdpaAttributesT attrs;
-    attrs.seq_len_kv_tensor_uid = 4;
-    auto graph = buildSdpaGraph(attrs);
+// ---------------------------------------------------------------------------
+// reference_verification gate
+// ---------------------------------------------------------------------------
 
-    EXPECT_FALSE(referenceCoversGraph(
-        ReferenceExecutorType::GPU, graph.GetBufferPointer(), graph.GetSize()));
+TEST(TestReferenceOpCoverage, ReferenceVerificationEnabledByDefault)
+{
+    const BundleMetadata metadata;
+    EXPECT_TRUE(referenceVerificationEnabled(ReferenceExecutorType::CPU, metadata));
+    EXPECT_TRUE(referenceVerificationEnabled(ReferenceExecutorType::GPU, metadata));
+}
+
+TEST(TestReferenceOpCoverage, ReferenceVerificationFlagsAreIndependent)
+{
+    BundleMetadata gpuDisabled;
+    gpuDisabled.referenceVerification.gpu = false;
+    EXPECT_TRUE(referenceVerificationEnabled(ReferenceExecutorType::CPU, gpuDisabled));
+    EXPECT_FALSE(referenceVerificationEnabled(ReferenceExecutorType::GPU, gpuDisabled));
+
+    BundleMetadata cpuDisabled;
+    cpuDisabled.referenceVerification.cpu = false;
+    EXPECT_FALSE(referenceVerificationEnabled(ReferenceExecutorType::CPU, cpuDisabled));
+    EXPECT_TRUE(referenceVerificationEnabled(ReferenceExecutorType::GPU, cpuDisabled));
 }
 
 // ---------------------------------------------------------------------------

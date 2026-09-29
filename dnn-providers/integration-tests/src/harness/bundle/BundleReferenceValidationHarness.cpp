@@ -33,6 +33,11 @@ void BundleReferenceValidationHarness::SetUp()
 
     ASSERT_NE(_bundle, nullptr) << "No bundle set";
 
+    if(!referenceVerificationEnabled(_referenceType, _bundle->metadata))
+    {
+        return;
+    }
+
     // Machine capability, not engine opinion: a bundle that wants more VRAM than
     // this card has, or an arch it was never meant for, cannot be validated here by
     // anyone. Checked before the no-skip contract, which is about verification.
@@ -80,25 +85,59 @@ std::unordered_map<int64_t, void*>
         *_bundle->tensors, outputs, wrapper.getTensorMap(), _bundle->outputTensorUids, useDevice());
 }
 
+// No skip path by design. An enabled reference covers every node type in this
+// graph (ReferenceOpCoverage.hpp), so declining it is a gap in the reference, not a
+// property of the bundle.
+bool BundleReferenceValidationHarness::checkApplicability()
+{
+    const bool verificationEnabled
+        = referenceVerificationEnabled(_referenceType, _bundle->metadata);
+    const char* label = referenceLabel(_referenceType);
+
+    bool applicable = false;
+    try
+    {
+        applicable = referenceExecutor().isApplicable(_bundle->graphBuffer.data(),
+                                                      _bundle->graphBuffer.size());
+    }
+    catch(const std::exception& e)
+    {
+        ADD_FAILURE() << label << " errored checking applicability of " << _bundlePath << ": "
+                      << e.what();
+        return false;
+    }
+
+    if(verificationEnabled && !applicable)
+    {
+        ADD_FAILURE() << label
+                      << " is required to support this graph (its node types are in the "
+                         "reference's supported-op set) but reports it is not applicable: "
+                      << _bundlePath;
+    }
+    else if(!verificationEnabled && applicable)
+    {
+        ADD_FAILURE() << "reference_verification disables " << label
+                      << " for this bundle, so it must report the graph inapplicable, but it "
+                         "accepted it: "
+                      << _bundlePath;
+    }
+    return verificationEnabled && applicable;
+}
+
 void BundleReferenceValidationHarness::TestBody()
 {
+    if(!checkApplicability())
+    {
+        return;
+    }
+
     auto referenceOutputs = allocateOutputs();
     auto variantPack = buildVariantPack(referenceOutputs);
 
-    IReferenceGraphExecutor& executor = referenceExecutor();
-
-    // No skip path by design. This bundle's node types are all inside this
-    // reference's required-op set (ReferenceOpCoverage.hpp), so an inapplicable or
-    // throwing reference is a gap in the reference, not a property of the bundle.
     try
     {
-        ASSERT_TRUE(executor.isApplicable(_bundle->graphBuffer.data(), _bundle->graphBuffer.size()))
-            << referenceLabel(_referenceType)
-            << " is required to support this graph (its node types are in the reference's "
-               "supported-op set) but reports it is not applicable: "
-            << _bundlePath;
-
-        executor.execute(_bundle->graphBuffer.data(), _bundle->graphBuffer.size(), variantPack);
+        referenceExecutor().execute(
+            _bundle->graphBuffer.data(), _bundle->graphBuffer.size(), variantPack);
     }
     catch(const ReferenceCapabilityError& e)
     {

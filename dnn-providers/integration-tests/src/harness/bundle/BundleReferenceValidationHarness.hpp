@@ -37,6 +37,10 @@ namespace hipdnn_integration_tests::bundle
 /// cannot run the graph is a gap in the reference, so it fails rather than skips.
 /// The one skip is device availability, checked before that gate: the GPU
 /// reference needs a device, so its suite skips on a runner that has none.
+///
+/// A bundle whose `reference_verification` metadata disables this reference is
+/// registered too, but only asserts that the reference reports the graph
+/// inapplicable. Nothing executes, so golden data is not required.
 class BundleReferenceValidationHarness : public ::testing::Test
 {
 public:
@@ -77,6 +81,9 @@ private:
     // does not build one per bundle.
     IReferenceGraphExecutor& referenceExecutor() const;
 
+    // Fails unless isApplicable() agrees with reference_verification; true only when
+    // the reference should go on to execute.
+    bool checkApplicability();
     bool useDevice() const;
     OutputTensors allocateOutputs() const;
     std::unordered_map<int64_t, void*> buildVariantPack(OutputTensors& outputs) const;

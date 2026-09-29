@@ -11,6 +11,7 @@
 
 #include <hipdnn_flatbuffers_sdk/data_objects/graph_generated.h>
 
+#include "harness/BundleMetadata.hpp"
 #include "harness/TestConfig.hpp"
 
 namespace hipdnn_integration_tests::bundle
@@ -49,8 +50,15 @@ const std::set<NodeAttributes>& referenceSupportedOps(ReferenceExecutorType type
 std::optional<std::set<NodeAttributes>> graphNodeTypes(const void* graphBuffer, size_t size);
 
 /// True iff the graph is readable and every node in it is inside `type`'s
-/// required-op set, and it uses no ragged or seq-len tensors.
+/// required-op set.
 bool referenceCoversGraph(ReferenceExecutorType type, const void* graphBuffer, size_t size);
+
+/// False when the bundle's `reference_verification` metadata disables `type`.
+///
+/// A disabled reference is not merely skipped: the golden-data harness still
+/// registers the bundle and requires the reference to report the graph
+/// inapplicable, so a reference that grows support forces the flag to be removed.
+bool referenceVerificationEnabled(ReferenceExecutorType type, const BundleMetadata& metadata);
 
 /// Human-readable node types the given reference does not cover, for diagnostics.
 ///

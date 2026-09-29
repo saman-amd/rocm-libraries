@@ -568,4 +568,71 @@ TEST(TestLoadBundleMetadata, EnforcementLevelNonStringRejectsMetadata)
     EXPECT_FALSE(meta.has_value());
 }
 
+// ---------------------------------------------------------------------------
+// loadBundleMetadata — reference_verification
+// ---------------------------------------------------------------------------
+
+TEST(TestLoadBundleMetadata, ReferenceVerificationDefaultsToEnabledWhenAbsent)
+{
+    const TempBundle bundle(R"({"format_version": 1})");
+    auto meta = loadBundleMetadata(bundle.bundleJsonPath());
+    ASSERT_TRUE(meta.has_value());
+    EXPECT_TRUE(meta->referenceVerification.cpu);
+    EXPECT_TRUE(meta->referenceVerification.gpu);
+}
+
+TEST(TestLoadBundleMetadata, ReferenceVerificationEmptyObjectKeepsDefaults)
+{
+    const TempBundle bundle(R"({"format_version": 1, "reference_verification": {}})");
+    auto meta = loadBundleMetadata(bundle.bundleJsonPath());
+    ASSERT_TRUE(meta.has_value());
+    EXPECT_TRUE(meta->referenceVerification.cpu);
+    EXPECT_TRUE(meta->referenceVerification.gpu);
+}
+
+TEST(TestLoadBundleMetadata, ReferenceVerificationParsesDeviceFalse)
+{
+    const TempBundle bundle(R"({"format_version": 1, "reference_verification": {"gpu": false}})");
+    auto meta = loadBundleMetadata(bundle.bundleJsonPath());
+    ASSERT_TRUE(meta.has_value());
+    EXPECT_TRUE(meta->referenceVerification.cpu);
+    EXPECT_FALSE(meta->referenceVerification.gpu);
+}
+
+TEST(TestLoadBundleMetadata, ReferenceVerificationParsesCpuFalse)
+{
+    const TempBundle bundle(
+        R"({"format_version": 1, "reference_verification": {"cpu": false, "gpu": true}})");
+    auto meta = loadBundleMetadata(bundle.bundleJsonPath());
+    ASSERT_TRUE(meta.has_value());
+    EXPECT_FALSE(meta->referenceVerification.cpu);
+    EXPECT_TRUE(meta->referenceVerification.gpu);
+}
+
+TEST(TestLoadBundleMetadata, ReferenceVerificationIgnoresUnknownKeys)
+{
+    const TempBundle bundle(
+        R"({"format_version": 1, "reference_verification": {"gpu": false, "tpu": false}})");
+    auto meta = loadBundleMetadata(bundle.bundleJsonPath());
+    ASSERT_TRUE(meta.has_value());
+    EXPECT_FALSE(meta->referenceVerification.gpu);
+}
+
+TEST(TestLoadBundleMetadata, ReferenceVerificationNonObjectRejectsMetadata)
+{
+    const TempBundle bundle(R"({"format_version": 1, "reference_verification": false})");
+    auto meta = loadBundleMetadata(bundle.bundleJsonPath());
+    EXPECT_FALSE(meta.has_value());
+}
+
+TEST(TestLoadBundleMetadata, ReferenceVerificationNonBooleanFlagRejectsMetadata)
+{
+    for(const auto* json : {R"({"format_version": 1, "reference_verification": {"gpu": "false"}})",
+                            R"({"format_version": 1, "reference_verification": {"cpu": 0}})"})
+    {
+        const TempBundle bundle(json);
+        EXPECT_FALSE(loadBundleMetadata(bundle.bundleJsonPath()).has_value()) << json;
+    }
+}
+
 // NOLINTEND(readability-identifier-naming)
