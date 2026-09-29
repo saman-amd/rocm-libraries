@@ -12,9 +12,9 @@
 #include <numeric>
 #include <vector>
 
-{% block config_define %}
 using config_provider = rocrand_impl::host::static_config_provider<{{ config.block_size_x }}, {{ config.grid_size }}>;
 
+{% block generator_define %}
 template<class ConfigProvider>
 using generator_template
     = rocrand_impl::host::{{ algo_name }}_generator_template<rocrand_impl::system::device_system,
