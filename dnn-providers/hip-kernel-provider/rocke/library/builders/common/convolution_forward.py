@@ -26,6 +26,7 @@ from kernels.common import conv_implicit_gemm as _conv
 
 _ARCH = "gfx950"
 _INT32_MAX = (1 << 31) - 1
+_PACKAGED_PIPELINES = ("mem", "compv3", "compv4", "basic")
 
 
 @dataclass(frozen=True)
@@ -189,8 +190,14 @@ def supports_gfx950_conv_fwd(
         value = getattr(spec, name)
         if type(value) is not int or not 0 < value <= _INT32_MAX:
             return False, f"{name} must be a positive signed 32-bit integer"
-    if spec.pipeline != "mem":
-        return False, "the packaged forward contract currently requires pipeline='mem'"
+    # Every pipeline here launches warp_m * warp_n * wave_size threads over the same
+    # (N-tiles, M-tiles, 1) grid with static LDS, which is the launch the native pack
+    # computes. "wavelet" appends load waves to the block and is WMMA-only anyway.
+    if spec.pipeline not in _PACKAGED_PIPELINES:
+        return False, (
+            f"the packaged forward contract supports pipelines {_PACKAGED_PIPELINES}, "
+            f"got {spec.pipeline!r}"
+        )
     if spec.epilogue not in ("default", "cshuffle"):
         return False, "epilogue must be 'default' or 'cshuffle'"
     try:

@@ -239,27 +239,58 @@ bool kernelFits(const MatchedProblem& matched, const KernelDefinition& kernel)
         }
     }
     const std::string dtype = matched.dtype == data_objects::DataType::HALF ? "fp16" : "bf16";
-    // These are the two packaged dispatcher configurations. Keep the complete tuning
-    // contract explicit: a new pipeline or atom needs its launch/ABI reviewed here.
-    // rocKE's default_vector_sizes picks vec_c > 1 for even K in both storage types;
-    // is_valid_spec permits the default epilogue only with scalar output stores.
-    return metadataEquals(kernel, "dtype", dtype)
-           && metadataEquals(kernel, "layout", std::string("NHWC"))
-           && metadataEquals(kernel, "groups", int64_t{1})
-           && metadataEquals(kernel, "tile_m", int64_t{64})
-           && metadataEquals(kernel, "tile_n", int64_t{64})
-           && (metadataEquals(kernel, "tile_k", int64_t{64})
-               || metadataEquals(kernel, "tile_k", int64_t{128}))
-           && metadataEquals(kernel, "warp_m", int64_t{2})
-           && metadataEquals(kernel, "warp_n", int64_t{2})
-           && metadataEquals(kernel, "warp_tile_m", int64_t{32})
-           && metadataEquals(kernel, "warp_tile_n", int64_t{32})
-           && metadataEquals(kernel, "warp_tile_k", int64_t{16})
-           && metadataEquals(kernel, "wave_size", int64_t{64})
-           && metadataEquals(kernel, "pipeline", std::string("mem"))
-           && (metadataEquals(kernel, "epilogue", std::string("cshuffle"))
-               || (p.k % 2 != 0 && metadataEquals(kernel, "epilogue", std::string("default"))))
-           && conv::launchGeometry(p, matched.geometry, 64, 64, 2, 2, 64).has_value();
+    if(!metadataEquals(kernel, "dtype", dtype)
+       || !metadataEquals(kernel, "layout", std::string("NHWC"))
+       || !metadataEquals(kernel, "groups", int64_t{1})
+       || !metadataEquals(kernel, "wave_size", int64_t{64}))
+    {
+        return false;
+    }
+
+    // The tuning values are whatever the build validated for this exact geometry: rocKE's
+    // is_valid_spec_for_problem ran on every variant before it was compiled, and the
+    // geometry fields above pin each kernel to one problem. What stays reviewed here is the
+    // launch contract. These pipelines all launch warp_m * warp_n * 64 threads over an
+    // (N-tiles, M-tiles, 1) grid with static LDS; "wavelet" appends load waves and is not
+    // accepted. rocKE picks vec_c > 1 for even K, and the default epilogue then needs
+    // scalar stores, so an even K takes cshuffle only.
+    const auto pipeline = kernel.metadata.find("pipeline");
+    const auto* pipelineName
+        = pipeline == kernel.metadata.end() ? nullptr : std::get_if<std::string>(&pipeline->second);
+    if(pipelineName == nullptr
+       || (*pipelineName != "mem" && *pipelineName != "compv3" && *pipelineName != "compv4"
+           && *pipelineName != "basic"))
+    {
+        return false;
+    }
+    if(!metadataEquals(kernel, "epilogue", std::string("cshuffle"))
+       && !(p.k % 2 != 0 && metadataEquals(kernel, "epilogue", std::string("default"))))
+    {
+        return false;
+    }
+
+    std::array<int64_t, 8> tuning{};
+    const std::array<const char*, 8> tuningFields{"tile_m",
+                                                  "tile_n",
+                                                  "tile_k",
+                                                  "warp_m",
+                                                  "warp_n",
+                                                  "warp_tile_m",
+                                                  "warp_tile_n",
+                                                  "warp_tile_k"};
+    for(size_t i = 0; i < tuningFields.size(); ++i)
+    {
+        const auto it = kernel.metadata.find(tuningFields[i]);
+        const auto* value
+            = it == kernel.metadata.end() ? nullptr : std::get_if<int64_t>(&it->second);
+        if(value == nullptr || *value <= 0)
+        {
+            return false;
+        }
+        tuning[i] = *value;
+    }
+    return conv::launchGeometry(p, matched.geometry, tuning[0], tuning[1], tuning[3], tuning[4], 64)
+        .has_value();
 }
 
 bool kernelMatches(const MatchContext& context,
@@ -275,8 +306,21 @@ double score(const MatchContext& /*context*/,
              const KernelDefinition& kernel)
 {
     // Deterministic fallback only. BenchmarkPlan replaces this order with measurements
-    // when benchmarking is enabled. tile_k=64 is the gfx950 dispatcher's default.
-    return metadataEquals(kernel, "tile_k", int64_t{64}) ? 1.0 : 0.0;
+    // when benchmarking is enabled. The top score is the gfx950 dispatcher's own pick,
+    // so an unbenchmarked run serves what rocKE would; its tile_k=128 sibling is next.
+    const bool dispatcherTile = metadataEquals(kernel, "tile_m", int64_t{64})
+                                && metadataEquals(kernel, "tile_n", int64_t{64})
+                                && metadataEquals(kernel, "warp_m", int64_t{2})
+                                && metadataEquals(kernel, "warp_n", int64_t{2})
+                                && metadataEquals(kernel, "warp_tile_m", int64_t{32})
+                                && metadataEquals(kernel, "warp_tile_n", int64_t{32})
+                                && metadataEquals(kernel, "warp_tile_k", int64_t{16})
+                                && metadataEquals(kernel, "pipeline", std::string("mem"));
+    if(!dispatcherTile)
+    {
+        return 0.0;
+    }
+    return metadataEquals(kernel, "tile_k", int64_t{64}) ? 2.0 : 1.0;
 }
 
 void requireBindings(const BoundTokens& bound, const Binding& binding)

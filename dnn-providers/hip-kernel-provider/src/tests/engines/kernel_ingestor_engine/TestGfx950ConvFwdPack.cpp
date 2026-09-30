@@ -8,6 +8,7 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -375,7 +376,29 @@ TEST(TestGfx950ConvFwdKernelMatcher, MissingOrWronglyTypedMetadataDeclinesCleanl
     }
 }
 
-TEST(TestGfx950ConvFwdKernelMatcher, DeclinesUnreviewedTuningAndUnpackagedCode)
+TEST(TestGfx950ConvFwdKernelMatcher, AcceptsSweptTuningForTheMatchedGeometry)
+{
+    // The build validated each variant against its geometry; the matcher admits any
+    // tuning whose launch it can compute, including the non-dispatcher pipelines.
+    const GraphFixture fixture(buildGraph(), gfx950Properties());
+    for(const auto* pipeline : {"mem", "compv3", "compv4", "basic"})
+    {
+        SCOPED_TRACE(pipeline);
+        auto kernel = smokeKernel();
+        kernel.metadata["tile_m"] = int64_t{256};
+        kernel.metadata["tile_n"] = int64_t{32};
+        kernel.metadata["tile_k"] = int64_t{32};
+        kernel.metadata["warp_m"] = int64_t{8};
+        kernel.metadata["warp_n"] = int64_t{1};
+        kernel.metadata["warp_tile_m"] = int64_t{16};
+        kernel.metadata["warp_tile_n"] = int64_t{16};
+        kernel.metadata["warp_tile_k"] = int64_t{32};
+        kernel.metadata["pipeline"] = std::string(pipeline);
+        EXPECT_TRUE(matchesKernel(GFX950_CONV_FWD, fixture.context(), kernel));
+    }
+}
+
+TEST(TestGfx950ConvFwdKernelMatcher, DeclinesUnreviewedLaunchContractAndUnpackagedCode)
 {
     const GraphFixture fixture(buildGraph(), gfx950Properties());
     for(const auto* field : {"tile_m",
@@ -385,15 +408,29 @@ TEST(TestGfx950ConvFwdKernelMatcher, DeclinesUnreviewedTuningAndUnpackagedCode)
                              "warp_n",
                              "warp_tile_m",
                              "warp_tile_n",
-                             "warp_tile_k",
-                             "wave_size"})
+                             "warp_tile_k"})
     {
         SCOPED_TRACE(field);
         auto kernel = smokeKernel();
-        kernel.metadata[field] = kernel.getIntMetadata(field) + 1;
+        kernel.metadata[field] = int64_t{0};
+        EXPECT_FALSE(matchesKernel(GFX950_CONV_FWD, fixture.context(), kernel));
+        kernel.metadata.erase(field);
+        EXPECT_FALSE(matchesKernel(GFX950_CONV_FWD, fixture.context(), kernel));
+        kernel.metadata[field] = std::string("64");
         EXPECT_FALSE(matchesKernel(GFX950_CONV_FWD, fixture.context(), kernel));
     }
     auto kernel = smokeKernel();
+    kernel.metadata["wave_size"] = int64_t{32};
+    EXPECT_FALSE(matchesKernel(GFX950_CONV_FWD, fixture.context(), kernel));
+    // 8 x 4 waves of 64 is 2048 threads, past the 1024-thread workgroup limit.
+    kernel = smokeKernel();
+    kernel.metadata["warp_m"] = int64_t{8};
+    kernel.metadata["warp_n"] = int64_t{4};
+    EXPECT_FALSE(matchesKernel(GFX950_CONV_FWD, fixture.context(), kernel));
+    kernel = smokeKernel();
+    kernel.metadata.erase("pipeline");
+    EXPECT_FALSE(matchesKernel(GFX950_CONV_FWD, fixture.context(), kernel));
+    kernel = smokeKernel();
     kernel.metadata["pipeline"] = std::string("wavelet");
     EXPECT_FALSE(matchesKernel(GFX950_CONV_FWD, fixture.context(), kernel));
     kernel = smokeKernel();
@@ -452,6 +489,20 @@ TEST(TestGfx950ConvFwdScore, FallbackPrefersDispatcherDefault)
     const GraphFixture fixture(buildGraph(), gfx950Properties());
     EXPECT_GT(scoreKernel(GFX950_CONV_FWD, fixture.context(), smokeKernel(64)),
               scoreKernel(GFX950_CONV_FWD, fixture.context(), smokeKernel(128)));
+    // Any swept tuning ranks below both dispatcher variants, so an unbenchmarked run
+    // serves what rocKE's dispatcher would.
+    for(const auto& change :
+        std::vector<std::pair<const char*, MetadataValue>>{{"tile_m", int64_t{256}},
+                                                           {"warp_m", int64_t{4}},
+                                                           {"warp_tile_k", int64_t{32}},
+                                                           {"pipeline", std::string("compv4")}})
+    {
+        SCOPED_TRACE(change.first);
+        auto swept = smokeKernel(64);
+        swept.metadata[change.first] = change.second;
+        EXPECT_GT(scoreKernel(GFX950_CONV_FWD, fixture.context(), smokeKernel(128)),
+                  scoreKernel(GFX950_CONV_FWD, fixture.context(), swept));
+    }
 }
 
 TEST(TestGfx950ConvFwdDispatch, RegisteredHandlerNeedsNoWorkspaceAndChecksBindings)
