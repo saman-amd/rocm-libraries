@@ -20,7 +20,7 @@ from builders.common.convolution_forward import (
 from dispatch.grouped_convolution import ConvGroupedRequest, dispatch_conv_grouped
 from rocke.core.ir import BF16, F16, I32, PtrType
 from rocke.core.lower_llvm import _lower_kernel_to_llvm_python
-from rocke.instances.common.conv_implicit_gemm import (
+from kernels.common.conv_implicit_gemm import (
     ConvProblem,
     build_implicit_gemm_conv,
 )
@@ -137,6 +137,16 @@ def test_serialized_spec_and_typed_builder_are_packager_compatible():
     assert typing.get_type_hints(build_gfx950_conv_fwd)["spec"] is Gfx950ConvFwdSpec
 
 
+@pytest.mark.parametrize("pipeline", ["compv3", "compv4", "basic"])
+def test_swept_pipelines_package_with_the_dispatchers_launch(pipeline):
+    # Only the schedule differs: block and grid are what the native pack computes.
+    spec = replace(gfx950_conv_fwd_spec_for_request(_request()), pipeline=pipeline)
+    assert supports_gfx950_conv_fwd(spec) == (True, "ok")
+    assert spec.block() == (256, 1, 1)
+    assert spec.grid() == gfx950_conv_fwd_spec_for_request(_request()).grid()
+    assert build_gfx950_conv_fwd(spec, arch="gfx950").name == spec.kernel_name()
+
+
 @pytest.mark.parametrize(
     "override",
     [
@@ -174,7 +184,7 @@ def test_symbols_include_attributes_missing_from_original_shape_name(override):
         ({"warp_m": 0}, "warp_m must be"),
         ({"tile_m": 96}, "not divisible"),
         ({"wave_size": 32}, "wave_size"),
-        ({"pipeline": "wavelet"}, "pipeline='mem'"),
+        ({"pipeline": "wavelet"}, "supports pipelines"),
         ({"epilogue": "unknown"}, "epilogue must be"),
         ({"epilogue": "default"}, "vector size c"),
         ({"Hi": 1, "Wi": 1, "Y": 7, "X": 7}, "nonpositive output"),
