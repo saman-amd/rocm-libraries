@@ -69,7 +69,7 @@ matmuls per wave — letting one wave process 16 groups simultaneously
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from rocke.core.ir import (
     F16,
@@ -80,7 +80,137 @@ from rocke.core.ir import (
     PtrType,
     Value,
 )
-from rocke.helpers.transforms import TensorDescriptor, embed, unmerge_magic
+from rocke.helpers.conv_abi import conv_direct_arg_names
+from rocke.helpers.transforms import (
+    DynamicTensorDescriptor,
+    TensorDescriptor,
+    embed,
+    embed_dynamic,
+    unmerge_magic,
+)
+
+
+# ---------------------------------------------------------------------
+# AOT plumbing shared by every direct-conv variant
+# ---------------------------------------------------------------------
+
+
+def emit_direct_params(b: IRBuilder, *, direction: str = "fwd") -> Dict[str, Value]:
+    """Declare the direct-conv kernarg block in :mod:`conv_abi` order.
+
+    Kernargs are packed positionally from the launch signature, so emitting
+    them from the same ordered list the signature is built from is what keeps
+    the two from drifting. See ``library/tests/test_conv_abi.py``.
+
+    ``direction="dgrad"`` selects the variant whose A/D stride triples follow
+    the reversed tensor layouts.
+    """
+    out: Dict[str, Value] = {}
+    for name, kind in conv_direct_arg_names(direction=direction):
+        if kind == "i32":
+            out[name] = b.param(name, I32)
+        elif kind == "d":
+            out[name] = b.param(
+                name, PtrType(F16, "global"), noalias=True, writeonly=True, align=16
+            )
+        else:
+            out[name] = b.param(
+                name, PtrType(F16, "global"), noalias=True, readonly=True, align=16
+            )
+    return out
+
+
+def direct_a_descriptor_dynamic(
+    b: IRBuilder,
+    params: Dict[str, Value],
+    *,
+    pad: int,
+    stride: int,
+    w_upper: Tuple[str, str] = ("q_pos", "W_lds_pos"),
+):
+    """Input descriptor ``A[N, H, W, total_c]`` with runtime extents.
+
+    Two embeds fold the conv-spatial algebra in, exactly as the compile-time
+    version did; only the bounds and the base strides become kernargs:
+
+    * ``embed(("y_iter",) -> "h", strides=(1,), offset=-PAD, lo=0, hi=H)``
+      turns the per-iteration row index into the input row and carries the
+      ``0 <= h < H`` check that makes the halo rows zero-fill.
+    * ``embed(w_upper -> "w", strides=(stride, 1), offset=-PAD, lo=0, hi=W)``
+      does the same for the column. The LDS-staged variants name that pair
+      ``(q_pos, W_lds_pos)``; the 4c variant reads straight from DRAM and
+      names it ``(wo, s)``.
+
+    ``PAD`` and ``stride`` stay build-time: they shape the LDS row and the
+    filter-tap offsets, so they are kernel capabilities rather than shape.
+    """
+    return DynamicTensorDescriptor.create(
+        "A_nhwc_direct",
+        coord_names=["n", "h", "w", "c"],
+        strides=[
+            params["p_A_stride_n"],
+            params["p_A_stride_hi"],
+            params["p_A_stride_wi"],
+            b.const_i32(1),
+        ],
+    ).transform(
+        embed_dynamic(
+            upper=("y_iter",),
+            lower="h",
+            strides=(1,),
+            offset=-pad,
+            lo=0,
+            hi=params["p_Hi"],
+        ),
+        embed_dynamic(
+            upper=w_upper,
+            lower="w",
+            strides=(stride, 1),
+            offset=-pad,
+            lo=0,
+            hi=params["p_Wi"],
+        ),
+    )
+
+
+def direct_d_descriptor_dynamic(b: IRBuilder, params: Dict[str, Value]):
+    """Output descriptor ``D[N, Ho, Wo, total_k]`` with runtime extents."""
+    return DynamicTensorDescriptor.create(
+        "D_nhwk_direct",
+        coord_names=["n", "h", "w", "k"],
+        strides=[
+            params["p_D_stride_n"],
+            params["p_D_stride_ho"],
+            params["p_D_stride_wo"],
+            b.const_i32(1),
+        ],
+    )
+
+
+def direct_row_loop_unroll(kh: int, *, lds_ping_pong: bool = True) -> int:
+    """How many row steps one ``scf.for`` body covers.
+
+    The row loop has build-time-periodic pieces that a runtime induction
+    variable would otherwise break:
+
+    * the accumulator slot ``(y - r) % KH`` rotates with period ``KH``;
+    * where the variant stages rows through LDS, the ping-pong buffer
+      alternates with period 2, and an LDS allocation is a build-time SSA
+      value that cannot be selected by a runtime index.
+
+    Unrolling the body by the least common multiple of those periods lines
+    them all up with the body boundary, so every buffer choice and slot index
+    inside it is a Python constant again while ``y`` itself stays runtime.
+    Because the step is a multiple of ``KH``, the loop variable is always
+    ``0 mod KH`` at the top of the body, which is what makes the slot indices
+    reduce to the unrolled position ``j``.
+
+    ``lds_ping_pong=False`` is for the variants that read straight from DRAM
+    (4c), where ``KH`` alone is enough.
+    """
+    from math import gcd
+
+    return 2 * kh // gcd(2, kh) if lds_ping_pong else kh
 
 
 @dataclass(frozen=True)
@@ -205,6 +335,32 @@ class DirectConv16cSpec:
             )
 
 
+def forward_padding_reason(p: "DirectConvProblem") -> Optional[str]:
+    """Why a forward direct-conv kernel cannot compute ``p``, or ``None``.
+
+    Every forward direct-conv kernel streams input rows and flushes output
+    row ``y - (KH-1)`` while it is below ``H`` -- i.e. it indexes output rows
+    by input rows. That is only right when the output is exactly as tall as
+    the input divided by the stride, which is the "same" padding
+    ``PAD == (KH-1)/2`` with an odd filter. Any other padding makes the
+    kernel write wrong rows, including rows of the next image in the batch,
+    rather than fail -- so it has to be refused here, before a binary for it
+    is built or cached.
+
+    The dgrad kernels are not bound by this: they bound their rows against
+    ``p_Ho`` explicitly.
+    """
+    if p.KH % 2 == 0 or p.KW % 2 == 0:
+        return f"forward direct conv needs odd filter extents (got {p.KH}x{p.KW})"
+    if p.PAD != (p.KH - 1) // 2:
+        return (
+            f"forward direct conv needs 'same' padding PAD == (KH-1)/2 = "
+            f"{(p.KH - 1) // 2} (got PAD={p.PAD}); the row stream indexes "
+            f"output rows by input rows"
+        )
+    return None
+
+
 def is_valid_spec_16c(
     spec: DirectConv16cSpec, arch: str = "gfx950"
 ) -> Tuple[bool, str]:
@@ -230,6 +386,16 @@ def is_valid_spec_16c(
     except KeyError as e:
         return False, str(e)
     p = spec.problem
+    why = forward_padding_reason(p)
+    if why is not None:
+        return False, why
+    # the fold_k32 16c kernel folds taps s=0/1 into one MFMA atom and handles s=2 as a
+    # separate residual, so the filter has to be exactly three wide.
+    if spec.fold_k32 and p.KW != 3:
+        return (
+            False,
+            f"the fold_k32 16c kernel is built for a 3-wide filter (got KW={p.KW})",
+        )
     if p.stride != 1:
         return False, f"stride > 1 is not supported (got {p.stride})"
     if p.cpg != 16 or p.kpg != 16:
@@ -292,12 +458,15 @@ def build_direct_conv_16c(
     b = IRBuilder(spec.kernel_name())
     b.kernel.attrs["max_workgroup_size"] = THREADS
 
-    A = b.param("A", PtrType(F16, "global"), noalias=True, readonly=True, align=16)
-    Bp = b.param("B", PtrType(F16, "global"), noalias=True, readonly=True, align=16)
-    D = b.param("D", PtrType(F16, "global"), noalias=True, writeonly=True, align=16)
-    A_bytes = b.param("A_bytes", I32)
-    B_bytes = b.param("B_bytes", I32)
-    D_bytes = b.param("D_bytes", I32)
+    params = emit_direct_params(b)
+    A = params["A"]
+    Bp = params["B"]
+    D = params["D"]
+    A_bytes = params["A_bytes"]
+    B_bytes = params["B_bytes"]
+    D_bytes = params["D_bytes"]
+    p_Hi = params["p_Hi"]
+    p_Wo = params["p_Wo"]
 
     c0 = b.const_i32(0)
     c_wave = b.const_i32(WAVE)
@@ -305,7 +474,7 @@ def build_direct_conv_16c(
     c_BQ = b.const_i32(BLOCK_Q)
     c_cpg = b.const_i32(p.cpg)
     c_kpg = b.const_i32(p.kpg)
-    c_W = b.const_i32(Wo)
+    c_W = p_Wo  # output-width bound for the store guard (runtime)
 
     # The address constants previously hand-rolled here
     # (``c_W_totalC``, ``c_H_W_totalC``, …) are now folded into the
@@ -521,28 +690,7 @@ def build_direct_conv_16c(
     # transforms.Embed always emits its bounds AND, regardless of how
     # trivially provable the range is. We skip the embed and pass
     # ``c=c_val`` directly to keep the SSA count tight on a hot path.
-    a_desc = TensorDescriptor.naive(
-        "A",
-        lengths=[p.N, p.H, p.W, p.total_c],
-        coord_names=("n", "h", "w", "c"),
-    ).transform(
-        embed(
-            upper=("y_iter",),
-            into="h",
-            strides=(1,),
-            offset=-p.PAD,
-            lo=0,
-            hi=p.H,
-        ),
-        embed(
-            upper=("q_pos", "W_lds_pos"),
-            into="w",
-            strides=(p.stride, 1),
-            offset=-p.PAD,
-            lo=0,
-            hi=p.W,
-        ),
-    )
+    a_desc = direct_a_descriptor_dynamic(b, params, pad=p.PAD, stride=p.stride)
 
     def issue_dram_load(y_iter_val: Value):
         """Per-thread DRAM read of one vec4 of A.
@@ -670,170 +818,163 @@ def build_direct_conv_16c(
     b.sync()
 
     # ---- the H-row streaming loop ----
-    # Iterates over input rows y = 0 .. H + KH - 2. For each input row
-    # the kernel accumulates KH contributions; accumulator slot
-    # p_flush_val = y - (KH-1) is flushed when it becomes valid and
-    # (for stride > 1) when it aligns to an output row.
-    n_iters = p.H + p.KH - 1
-    acc_tiles: List[List[Value]] = [
-        [zero_acc, zero_acc, zero_acc] for _ in range(q_subtiles)
+    # Streams input rows y = 0 .. H + KH - 2. Each input row contributes to
+    # KH accumulator slots; slot ``(y - (KH-1)) % KH`` is complete at the end
+    # of iteration y and is flushed to D when that row maps to a real output
+    # row.
+    #
+    # AOT: H is a kernarg, so the row count is runtime. Two things in the body
+    # are build-time-periodic and would break under a runtime induction
+    # variable -- the LDS ping-pong (period 2, and an LDS allocation cannot be
+    # selected by a runtime index) and the accumulator slot rotation (period
+    # KH). Unrolling the body lcm(2, KH) times aligns both periods with the
+    # body boundary: the step is a multiple of KH, so the loop variable is
+    # always 0 mod KH at the top and every buffer choice and slot index inside
+    # reduces to a Python constant again.
+    #
+    # The trip count rounds up, so the last body may run past H + KH - 2.
+    # That costs nothing and needs no guard: the A descriptor's
+    # ``0 <= h < H`` bound zero-fills those loads, and the flush predicate
+    # below drops any row outside ``[0, H)``.
+    UNROLL = direct_row_loop_unroll(p.KH)
+    c_unroll = b.const_i32(UNROLL)
+    n_iters_v = b.add(p_Hi, b.const_i32(p.KH - 1))
+
+    # Output descriptor: D[N, Ho, Wo, total_k] in NHWK. Built ONCE outside
+    # the loop so each iteration only pays one ``d_desc.offset`` emission.
+    d_desc = direct_d_descriptor_dynamic(b, params)
+
+    # One accumulator per (q_subtile, KH slot), carried across the loop.
+    acc_args = [
+        (f"acc_q{qt}_p{pi}", zero_acc) for qt in range(q_subtiles) for pi in range(p.KH)
     ]
 
-    # Output descriptor: D[N, Ho, Wo, total_k] in NHWK. Built ONCE
-    # outside the H-loop so each iter only pays one ``d_desc.offset``
-    # SSA emission rather than reconstructing the descriptor object.
-    d_desc = TensorDescriptor.naive(
-        "D",
-        lengths=[p.N, Ho, Wo, p.total_k],
-        coord_names=("n", "h", "w", "k"),
-    )
+    def _acc_index(qt: int, pi: int) -> int:
+        return qt * p.KH + pi
 
-    for y in range(n_iters):
-        cur = A_smem if (y % 2 == 0 or not spec.double_buffer) else B_smem
-        nxt = B_smem if (y % 2 == 0 or not spec.double_buffer) else A_smem
+    for_op = b.scf_for_iter(c0, n_iters_v, c_unroll, acc_args, iv_name="y_row")
+    with for_op as (y_base, loop_accs):
+        accs_flat = list(loop_accs)
 
-        # Read inputs from the current buffer first; no writes to
-        # `cur` are issued until the next time it becomes `nxt`.
-        if spec.fold_k32:
-            inputs_by_q = [
-                (lds_read_input_k32(qt, cur), lds_read_input_s2_k32(qt, cur))
-                for qt in range(q_subtiles)
-            ]
-        else:
-            inputs_by_q = [
-                [lds_read_input(qt, s, cur) for s in range(p.KW)]
-                for qt in range(q_subtiles)
-            ]
+        for j in range(UNROLL):
+            cur = A_smem if (j % 2 == 0 or not spec.double_buffer) else B_smem
+            nxt = B_smem if (j % 2 == 0 or not spec.double_buffer) else A_smem
 
-        # Issue DRAM reads for the next row into registers before
-        # the MFMAs. Store those registers to the next LDS buffer
-        # after MFMAs to overlap the next-row load with this-row compute.
-        # ``y_iter`` is the unshifted row index; the A_desc embed folds
-        # the -PAD and the (0 <= h < H) check.
-        loads_next = None
-        if y + 1 < n_iters:
-            loads_next = issue_dram_load(b.const_i32(y + 1))
+            # Read inputs from the current buffer first; no writes to `cur`
+            # are issued until the next time it becomes `nxt`.
+            if spec.fold_k32:
+                inputs_by_q = [
+                    (lds_read_input_k32(qt, cur), lds_read_input_s2_k32(qt, cur))
+                    for qt in range(q_subtiles)
+                ]
+            else:
+                inputs_by_q = [
+                    [lds_read_input(qt, s, cur) for s in range(p.KW)]
+                    for qt in range(q_subtiles)
+                ]
 
-        for qt in range(q_subtiles):
-            accs = acc_tiles[qt]
-            for r_const in range(p.KH):
-                p_idx = (y - r_const) % p.KH
-                acc_in = accs[p_idx]
-                if spec.fold_k32:
-                    input_k32, input_s2 = inputs_by_q[qt]
-                    # CORRECTNESS-CRITICAL: both folded MFMAs are the *same*
-                    # width (wide K=32). S=0/1 fold into one 16x16x32 atom;
-                    # the S=2 residual is promoted to a SECOND 16x16x32 atom
-                    # with its upper 16 K zero-padded (``weights_s2_k32`` /
-                    # ``lds_read_input_s2_k32`` zero the c4 in {2,3} lane
-                    # groups). Chaining two same-width atoms on one
-                    # accumulator -- ``acc = k32(s2pad, k32(s01, acc))`` --
-                    # matches the mfma_gemm hero path that runs the wide atom
-                    # correctly. The earlier fold mixed a 16x16x16 residual
-                    # into the same accumulator as the 16x16x32 atom; a narrow
-                    # MFMA whose C-operand is the just-written result of a wide
-                    # MFMA (or vice versa) is a read-after-write accumulator
-                    # hazard that BOTH the comgr LLVM-direct backend AND hipcc
-                    # miscompile in this fully-unrolled kernel (the wide atom's
-                    # longer accumulation latency is dropped when its result
-                    # feeds the next, different-width MFMA's C input), silently
-                    # corrupting accumulator slots on the H-edge output rows in
-                    # a SHAPE-DEPENDENT way (~0.5-0.8% bad, max_abs ~360).
-                    # Keeping both atoms the same width removes the hazard and
-                    # keeps a single accumulator per slot (no occupancy hit
-                    # from a second accumulator triple). Verified bad=0 across
-                    # shapes on gfx950 via both comgr and hipcc.
-                    #
-                    # NOTE: this builder still rides the legacy hand-rolled
-                    # MFMA lane math (s_lane_k32 / ch_lane_k32 magic constants)
-                    # rather than the unified ``op_for_shape`` +
-                    # ``op.c_layout().coord(...)`` contract that mfma_gemm is
-                    # migrating to (refactor_opportunities.md items 1-4).
-                    # Migrating the C-accumulator readout + A/B K-pack to
-                    # c_layout().coord would delete this whole hazard class at
-                    # the source; tracked as a follow-up.
-                    acc_in = b.mfma_f32_16x16x32_f16(
-                        weights_k32[r_const], input_k32, acc_in
-                    )
-                    acc_in = b.mfma_f32_16x16x32_f16(
-                        weights_s2_k32[r_const], input_s2, acc_in
-                    )
-                else:
-                    inputs = inputs_by_q[qt]
-                    for s_const in range(p.KW):
-                        w_idx = r_const * p.KW + s_const
-                        acc_in = b.mfma_f32_16x16x16_f16(
-                            weights[w_idx], inputs[s_const], acc_in
+            # Issue DRAM reads for the next row into registers before the
+            # MFMAs, and commit them to the next LDS buffer afterwards, so the
+            # VMEM latency overlaps this row's compute. Rows past the image
+            # zero-fill through the descriptor bound, so this is unconditional.
+            loads_next = issue_dram_load(b.add(y_base, b.const_i32(j + 1)))
+
+            for qt in range(q_subtiles):
+                for r_const in range(p.KH):
+                    # y_base is 0 mod KH (the step is a multiple of KH), so
+                    # the rotating slot index collapses to a constant.
+                    p_idx = (j - r_const) % p.KH
+                    flat = _acc_index(qt, p_idx)
+                    acc_in = accs_flat[flat]
+                    if spec.fold_k32:
+                        input_k32, input_s2 = inputs_by_q[qt]
+                        # CORRECTNESS-CRITICAL: both folded MFMAs are the
+                        # *same* width (wide K=32). S=0/1 fold into one
+                        # 16x16x32 atom; the S=2 residual is promoted to a
+                        # SECOND 16x16x32 atom with its upper 16 K zero-padded
+                        # (``weights_s2_k32`` / ``lds_read_input_s2_k32`` zero
+                        # the c4 in {2,3} lane groups). Chaining two same-width
+                        # atoms on one accumulator matches the mfma_gemm hero
+                        # path. Mixing a 16x16x16 residual into the same
+                        # accumulator as a 16x16x32 atom is a read-after-write
+                        # accumulator hazard that both the comgr LLVM-direct
+                        # backend and hipcc miscompile here, silently
+                        # corrupting the H-edge output rows in a
+                        # shape-dependent way.
+                        acc_in = b.mfma_f32_16x16x32_f16(
+                            weights_k32[r_const], input_k32, acc_in
                         )
-                accs[p_idx] = acc_in
+                        acc_in = b.mfma_f32_16x16x32_f16(
+                            weights_s2_k32[r_const], input_s2, acc_in
+                        )
+                    else:
+                        inputs = inputs_by_q[qt]
+                        for s_const in range(p.KW):
+                            w_idx = r_const * p.KW + s_const
+                            acc_in = b.mfma_f32_16x16x16_f16(
+                                weights[w_idx], inputs[s_const], acc_in
+                            )
+                    accs_flat[flat] = acc_in
 
-        if loads_next is not None:
             # Single-buffer correctness barrier. When ``double_buffer`` is
-            # False, ``cur`` and ``nxt`` are the SAME LDS allocation, so
-            # the ``store_to_lds`` below overwrites the row this iteration
-            # just read via ``lds_read_input``. With more than one wave per
-            # workgroup (``block_groups > 1``) the only barrier used to be
-            # the one at the end of the iteration, so a fast wave could
-            # begin storing row y+1 into LDS while a slower wave was still
-            # issuing its ds_reads for row y -- a read-after-write race that
-            # corrupted the slower waves' inputs (seen as *nondeterministic*
-            # wrong outputs concentrated in the interior waves/groups and
-            # near the H/W edges). The next-row DRAM loads were already
-            # issued into registers above, so this barrier only forces every
-            # wave to finish reading the current LDS row before any wave
-            # overwrites it; the MFMAs above overlap the ds_read latency.
-            # The double-buffer path doesn't need it (the store targets the
-            # other ping-pong buffer).
+            # False, ``cur`` and ``nxt`` are the SAME allocation, so the store
+            # below overwrites the row this iteration just read. With more than
+            # one wave per workgroup the end-of-iteration barrier alone lets a
+            # fast wave start storing row y+1 while a slower wave is still
+            # issuing ds_reads for row y -- a read-after-write race. The
+            # next-row DRAM loads are already in registers, so this barrier
+            # only orders the LDS access, and the MFMAs above still hide the
+            # ds_read latency. The double-buffer path targets the other
+            # ping-pong buffer and needs no extra barrier.
             if not spec.double_buffer:
                 b.sync()
             store_to_lds(loads_next, nxt)
-        b.sync()
+            b.sync()
 
-        # Flush output for row p_flush = y - (KH-1) when in range,
-        # then ALWAYS reset accs[P_FLUSH = p_flush_val % KH] to zero.
-        #
-        # The unconditional reset (NOT inside the `if`) is the key
-        # correctness fix. Without it, iters y=0..KH-2 (whose
-        # p_flush_val is negative) leak their r=KH-1 contributions
-        # into accs[(-y-1)%KH], which the next flush of that slot
-        # (for a valid output row) accidentally includes.
-        # Concretely: y=1, r=2 leaks `weight[r=2] * input[hi=0]`
-        # into accs[2]; later acc[2] is flushed for ho=2 with three
-        # correct contributions, *plus* the leak, producing a wrong
-        # answer. The unconditional `accs[P_FLUSH] = zero_acc` reset
-        # ensures every flushed slot starts from a clean accumulator.
-        p_flush_val = y - (p.KH - 1)
-        P_FLUSH = p_flush_val % p.KH
-        if 0 <= p_flush_val < p.H and p_flush_val % c_stride == 0:
-            # ``p_flush_val`` is the input row that produced a complete set
-            # of KH contributions. For stride > 1 only rows that align to
-            # an output position (p_flush_val % stride == 0) generate a
-            # write; the output row index is p_flush_val // stride.
-            ho_row = p_flush_val // c_stride
+            # Flush the slot completed by this row, then ALWAYS reset it.
+            #
+            # The unconditional reset is load-bearing: the first KH-1
+            # iterations have a negative flush row and would otherwise leak
+            # their r = KH-1 contributions into the slot that a later, real
+            # output row flushes, silently adding an extra term.
+            P_FLUSH = (j - (p.KH - 1)) % p.KH
+            p_flush_v = b.add(y_base, b.const_i32(j - (p.KH - 1)))
+            # Row is real when 0 <= p_flush < H, and for stride > 1 only when
+            # it lands on an output position.
+            row_ok = b.land(b.cmp_ge(p_flush_v, c0), b.cmp_lt(p_flush_v, p_Hi))
+            if c_stride > 1:
+                c_stride_v = b.const_i32(c_stride)
+                row_ok = b.land(row_ok, b.cmp_eq(b.mod(p_flush_v, c_stride_v), c0))
+                ho_row_v = b.div(p_flush_v, c_stride_v)
+            else:
+                ho_row_v = p_flush_v
+            # Clamp the row index so an out-of-range flush cannot build a
+            # wild descriptor offset before the store predicate drops it.
+            ho_row_v = b.select(row_ok, ho_row_v, c0)
+
             for qt in range(q_subtiles):
-                acc_to_flush = acc_tiles[qt][P_FLUSH]
+                flat = _acc_index(qt, P_FLUSH)
+                acc_to_flush = accs_flat[flat]
                 out_q = b.add(b.add(q_tile_start, b.const_i32(qt * 16)), q_in_lane)
-                out_q_valid = b.cmp_lt(out_q, c_W)
+                store_ok = b.land(row_ok, b.cmp_lt(out_q, c_W))
                 k_val = b.add(b.mul(g, c_kpg), b.mul(c4, b.const_i32(4)))
                 d_base, _ = d_desc.offset(
                     b,
                     n=n,
-                    h=b.const_i32(ho_row),
+                    h=ho_row_v,
                     w=out_q,
                     k=k_val,
                 )
                 d_base_bytes = b.mul(d_base, c_half_bytes)
-                safe_d_off = b.select(out_q_valid, d_base_bytes, oob_sentinel)
+                safe_d_off = b.select(store_ok, d_base_bytes, oob_sentinel)
                 # The 4 per-lane output elements are contiguous in NHWK:
-                # k_out = g*kpg + c4*4 + [0..3].  Store them as one
-                # 64-bit vector instead of four scalar buffer_store_short
-                # ops.
+                # k_out = g*kpg + c4*4 + [0..3]. Store them as one 64-bit
+                # vector instead of four scalar buffer_store_short ops.
                 acc_h = b.vec_trunc_f32_to_f16(acc_to_flush)
                 b.buffer_store_vN_f16(d_rsrc, safe_d_off, c0, acc_h, 2)
-        # Unconditional slot reset — kills early-iter leaks before they
-        # pollute a later output row.
-        for qt in range(q_subtiles):
-            acc_tiles[qt][P_FLUSH] = zero_acc
+                accs_flat[flat] = zero_acc
+
+        b.scf_yield(*accs_flat)
 
     return b.kernel
 
@@ -900,6 +1041,9 @@ def is_valid_spec_4c(spec: DirectConv4cSpec, arch: str = "gfx950") -> Tuple[bool
     except KeyError as e:
         return False, str(e)
     p = spec.problem
+    why = forward_padding_reason(p)
+    if why is not None:
+        return False, why
     if p.stride != 1:
         return False, f"stride > 1 is not supported (got {p.stride})"
     if p.cpg != 4 or p.kpg != 4:
@@ -940,15 +1084,17 @@ def build_direct_conv_4c(spec: DirectConv4cSpec, *, arch: str = "gfx950") -> Ker
     b = IRBuilder(spec.kernel_name())
     b.kernel.attrs["max_workgroup_size"] = spec.threads_per_block
 
-    A = b.param("A", PtrType(F16, "global"), noalias=True, readonly=True, align=16)
-    Bp = b.param("B", PtrType(F16, "global"), noalias=True, readonly=True, align=16)
-    D = b.param("D", PtrType(F16, "global"), noalias=True, writeonly=True, align=16)
-    A_bytes = b.param("A_bytes", I32)
-    B_bytes = b.param("B_bytes", I32)
-    D_bytes = b.param("D_bytes", I32)
+    params = emit_direct_params(b)
+    A = params["A"]
+    Bp = params["B"]
+    D = params["D"]
+    A_bytes = params["A_bytes"]
+    B_bytes = params["B_bytes"]
+    D_bytes = params["D_bytes"]
+    p_Hi = params["p_Hi"]
 
     c0 = b.const_i32(0)
-    c_W = b.const_i32(Wo)
+    c_W = params["p_Wo"]  # output-width bound for the store guard (runtime)
     c_cpg = b.const_i32(p.cpg)
     c_kpg = b.const_i32(p.kpg)
     # Same addressing convention as the 16c kernel: the per-axis
@@ -1006,42 +1152,18 @@ def build_direct_conv_4c(spec: DirectConv4cSpec, *, arch: str = "gfx950") -> Ker
     acc_tiles: List[List[Value]] = [
         [zero_acc, zero_acc, zero_acc] for _ in range(q_tiles_per_wave)
     ]
-    n_iters = p.H + p.KH - 1
-    c_stride_4c = p.stride  # Python int used in emit-time flush guard
+    c_stride_4c = p.stride  # build-time capability: shapes the tap offsets
 
     # Input descriptor: A[N, H, W, total_c] in NHWC.
     # y_iter is the input row index; wo is the output W position.
     # h = y_iter - PAD  (stride-1 in H: the loop walks input rows)
     # w = wo * stride + s - PAD  (stride in W from output column)
-    a_desc = TensorDescriptor.naive(
-        "A",
-        lengths=[p.N, p.H, p.W, p.total_c],
-        coord_names=("n", "h", "w", "c"),
-    ).transform(
-        embed(
-            upper=("y_iter",),
-            into="h",
-            strides=(1,),
-            offset=-p.PAD,
-            lo=0,
-            hi=p.H,
-        ),
-        embed(
-            upper=("wo", "s"),
-            into="w",
-            strides=(p.stride, 1),
-            offset=-p.PAD,
-            lo=0,
-            hi=p.W,
-        ),
+    a_desc = direct_a_descriptor_dynamic(
+        b, params, pad=p.PAD, stride=p.stride, w_upper=("wo", "s")
     )
 
     # Output descriptor: D[N, Ho, Wo, total_k] in NHWK.
-    d_desc = TensorDescriptor.naive(
-        "D",
-        lengths=[p.N, Ho, Wo, p.total_k],
-        coord_names=("n", "h", "w", "k"),
-    )
+    d_desc = direct_d_descriptor_dynamic(b, params)
 
     c_val_groupc = b.mul(g, c_cpg)
     # ``q_pos = q_base + lane_q`` (= ``wo`` for the embed) is the same
@@ -1051,65 +1173,105 @@ def build_direct_conv_4c(spec: DirectConv4cSpec, *, arch: str = "gfx950") -> Ker
     # ``wo=q_pos`` and ``s=const`` straight to the descriptor.
     s_consts = [b.const_i32(s) for s in range(p.KW)]
 
-    for y in range(n_iters):
-        y_iter = b.const_i32(y)
+    # ---- the H-row streaming loop ----
+    # AOT: H is a kernarg, so the trip count is runtime. The only build-time
+    # periodicity in this variant is the accumulator slot rotation (period
+    # KH) -- 4c reads straight from DRAM, with no LDS ping-pong -- so the body
+    # is unrolled KH times. The step is then a multiple of KH, which keeps the
+    # loop variable at 0 mod KH and every slot index a Python constant.
+    #
+    # The trip count rounds up; rows past the image zero-fill through the A
+    # descriptor's ``0 <= h < H`` bound and the flush predicate drops them.
+    UNROLL = direct_row_loop_unroll(p.KH, lds_ping_pong=False)
+    c_unroll = b.const_i32(UNROLL)
+    n_iters_v = b.add(p_Hi, b.const_i32(p.KH - 1))
 
-        inputs_by_qtile: List[List[Value]] = []
-        for qt in range(q_tiles_per_wave):
-            q_base = b.add(q_tile_start, b.const_i32(qt * 4))
-            q_pos = b.add(q_base, lane_q)
-            inputs: List[Value] = []
-            for s_idx, s_val in enumerate(s_consts):
-                a_off, valid = a_desc.offset(
-                    b,
-                    n=n,
-                    y_iter=y_iter,
-                    wo=q_pos,
-                    s=s_val,
-                    c=c_val_groupc,
-                )
-                safe_a = b.select(valid, b.mul(a_off, c_half_bytes), oob_sentinel)
-                vec = b.buffer_load_vN_f16(a_rsrc, safe_a, c0, 2)
-                vec = b.select(valid, vec, fp16x4_zero)
-                inputs.append(vec)
-            inputs_by_qtile.append(inputs)
+    acc_args = [
+        (f"acc_q{qt}_p{pi}", zero_acc)
+        for qt in range(q_tiles_per_wave)
+        for pi in range(p.KH)
+    ]
 
-        for qt in range(q_tiles_per_wave):
-            accs = acc_tiles[qt]
-            inputs = inputs_by_qtile[qt]
-            for r_const in range(p.KH):
-                p_idx = (y - r_const) % p.KH
-                acc = accs[p_idx]
-                for s_const in range(p.KW):
-                    acc = b.mfma_f32_4x4x4_f16(
-                        weights[r_const * p.KW + s_const], inputs[s_const], acc
+    def _acc_index(qt: int, pi: int) -> int:
+        return qt * p.KH + pi
+
+    for_op = b.scf_for_iter(c0, n_iters_v, c_unroll, acc_args, iv_name="y_row")
+    with for_op as (y_base, loop_accs):
+        accs_flat = list(loop_accs)
+
+        for j in range(UNROLL):
+            y_iter = b.add(y_base, b.const_i32(j))
+
+            inputs_by_qtile: List[List[Value]] = []
+            for qt in range(q_tiles_per_wave):
+                q_base = b.add(q_tile_start, b.const_i32(qt * 4))
+                q_pos = b.add(q_base, lane_q)
+                inputs: List[Value] = []
+                for s_idx, s_val in enumerate(s_consts):
+                    a_off, valid = a_desc.offset(
+                        b,
+                        n=n,
+                        y_iter=y_iter,
+                        wo=q_pos,
+                        s=s_val,
+                        c=c_val_groupc,
                     )
-                accs[p_idx] = acc
+                    safe_a = b.select(valid, b.mul(a_off, c_half_bytes), oob_sentinel)
+                    vec = b.buffer_load_vN_f16(a_rsrc, safe_a, c0, 2)
+                    vec = b.select(valid, vec, fp16x4_zero)
+                    inputs.append(vec)
+                inputs_by_qtile.append(inputs)
 
-        p_flush = y - (p.KH - 1)
-        P_FLUSH = p_flush % p.KH
-        if 0 <= p_flush < p.H and p_flush % c_stride_4c == 0:
-            ho_row = p_flush // c_stride_4c
+            for qt in range(q_tiles_per_wave):
+                inputs = inputs_by_qtile[qt]
+                for r_const in range(p.KH):
+                    # y_base is 0 mod KH, so the rotating slot collapses to j.
+                    p_idx = (j - r_const) % p.KH
+                    flat = _acc_index(qt, p_idx)
+                    acc = accs_flat[flat]
+                    for s_const in range(p.KW):
+                        acc = b.mfma_f32_4x4x4_f16(
+                            weights[r_const * p.KW + s_const], inputs[s_const], acc
+                        )
+                    accs_flat[flat] = acc
+
+            # Flush the slot this row completed, then ALWAYS reset it: the
+            # first KH-1 rows have a negative flush index and would otherwise
+            # leak their r = KH-1 term into a slot a later real output row
+            # flushes.
+            P_FLUSH = (j - (p.KH - 1)) % p.KH
+            p_flush_v = b.add(y_base, b.const_i32(j - (p.KH - 1)))
+            row_ok = b.land(b.cmp_ge(p_flush_v, c0), b.cmp_lt(p_flush_v, p_Hi))
+            if c_stride_4c > 1:
+                c_stride_v = b.const_i32(c_stride_4c)
+                row_ok = b.land(row_ok, b.cmp_eq(b.mod(p_flush_v, c_stride_v), c0))
+                ho_row_v = b.div(p_flush_v, c_stride_v)
+            else:
+                ho_row_v = p_flush_v
+            ho_row_v = b.select(row_ok, ho_row_v, c0)
+
             k_out_base = b.mul(g, c_kpg)
             for qt in range(q_tiles_per_wave):
-                acc = acc_tiles[qt][P_FLUSH]
+                flat = _acc_index(qt, P_FLUSH)
+                acc = accs_flat[flat]
                 q_base = b.add(q_tile_start, b.const_i32(qt * 4))
                 out_q = b.add(q_base, lane_q)
-                out_q_ok = b.cmp_lt(out_q, c_W)
+                store_ok = b.land(row_ok, b.cmp_lt(out_q, c_W))
                 d_base, _ = d_desc.offset(
                     b,
                     n=n,
-                    h=b.const_i32(ho_row),
+                    h=ho_row_v,
                     w=out_q,
                     k=k_out_base,
                 )
-                safe_d = b.select(out_q_ok, b.mul(d_base, c_half_bytes), oob_sentinel)
+                safe_d = b.select(store_ok, b.mul(d_base, c_half_bytes), oob_sentinel)
                 # MFMA 4x4x4 wave64 per-lane output layout:
                 #   acc[i] -> D[n, ho_row, out_q, g*kpg + i]  for i in 0..3
                 acc_h = b.vec_trunc_f32_to_f16(acc)
                 b.buffer_store_vN_f16(d_rsrc, safe_d, c0, acc_h, 2)
-        for qt in range(q_tiles_per_wave):
-            acc_tiles[qt][P_FLUSH] = zero_acc
+                accs_flat[flat] = zero_acc
+
+        b.scf_yield(*accs_flat)
 
     return b.kernel
 
@@ -1201,6 +1363,13 @@ def is_valid_spec_8c(spec: DirectConv8cSpec, arch: str = "gfx950") -> Tuple[bool
     except KeyError as e:
         return False, str(e)
     p = spec.problem
+    why = forward_padding_reason(p)
+    if why is not None:
+        return False, why
+    # the 8c kernel folds taps s=0/1 into one MFMA atom and handles s=2 as a
+    # separate residual, so the filter has to be exactly three wide.
+    if p.KW != 3:
+        return False, f"the 8c kernel is built for a 3-wide filter (got KW={p.KW})"
     if p.stride != 1:
         return False, f"stride > 1 is not supported (got {p.stride})"
     if p.cpg != 8 or p.kpg != 8:
@@ -1261,12 +1430,15 @@ def build_direct_conv_8c(spec: DirectConv8cSpec, arch: str = "gfx950") -> Kernel
     b = IRBuilder(spec.kernel_name())
     b.kernel.attrs["max_workgroup_size"] = THREADS
 
-    A = b.param("A", PtrType(F16, "global"), noalias=True, readonly=True, align=16)
-    Bp = b.param("B", PtrType(F16, "global"), noalias=True, readonly=True, align=16)
-    D = b.param("D", PtrType(F16, "global"), noalias=True, writeonly=True, align=16)
-    A_bytes = b.param("A_bytes", I32)
-    B_bytes = b.param("B_bytes", I32)
-    D_bytes = b.param("D_bytes", I32)
+    params = emit_direct_params(b)
+    A = params["A"]
+    Bp = params["B"]
+    D = params["D"]
+    A_bytes = params["A_bytes"]
+    B_bytes = params["B_bytes"]
+    D_bytes = params["D_bytes"]
+    p_Hi = params["p_Hi"]
+    p_Wo = params["p_Wo"]
 
     c0 = b.const_i32(0)
     c_wave = b.const_i32(WAVE)
@@ -1274,7 +1446,7 @@ def build_direct_conv_8c(spec: DirectConv8cSpec, arch: str = "gfx950") -> Kernel
     c_BQ = b.const_i32(BLOCK_Q)
     c_cpg = b.const_i32(p.cpg)
     c_kpg = b.const_i32(p.kpg)
-    c_W = b.const_i32(Wo)
+    c_W = p_Wo  # output-width bound for the store guard (runtime)
     c_BG_cpg = b.const_i32(BLOCK_GROUPS * p.cpg)
     c_half_bytes = b.const_i32(2)
     oob_sentinel = b.const_i32((1 << 31) - 1)
@@ -1391,28 +1563,7 @@ def build_direct_conv_8c(spec: DirectConv8cSpec, arch: str = "gfx950") -> Kernel
             }
         )
 
-    a_desc = TensorDescriptor.naive(
-        "A",
-        lengths=[p.N, p.H, p.W, p.total_c],
-        coord_names=("n", "h", "w", "c"),
-    ).transform(
-        embed(
-            upper=("y_iter",),
-            into="h",
-            strides=(1,),
-            offset=-p.PAD,
-            lo=0,
-            hi=p.H,
-        ),
-        embed(
-            upper=("q_pos", "W_lds_pos"),
-            into="w",
-            strides=(p.stride, 1),
-            offset=-p.PAD,
-            lo=0,
-            hi=p.W,
-        ),
-    )
+    a_desc = direct_a_descriptor_dynamic(b, params, pad=p.PAD, stride=p.stride)
 
     c_stride_8c = p.stride
 
@@ -1496,77 +1647,102 @@ def build_direct_conv_8c(spec: DirectConv8cSpec, arch: str = "gfx950") -> Kernel
     store_to_lds(issue_dram_load(c0), A_smem)
     b.sync()
 
-    n_iters = p.H + p.KH - 1
-    acc_tiles: List[List[Value]] = [
-        [zero_acc, zero_acc, zero_acc] for _ in range(q_subtiles)
+    # ---- the H-row streaming loop ----
+    # AOT: H is a kernarg. The body is unrolled lcm(2, KH) times so the LDS
+    # ping-pong (period 2) and the accumulator slot rotation (period KH) both
+    # line up with the body boundary and stay Python constants while y is
+    # runtime. See direct_row_loop_unroll.
+    UNROLL = direct_row_loop_unroll(p.KH)
+    c_unroll = b.const_i32(UNROLL)
+    n_iters_v = b.add(p_Hi, b.const_i32(p.KH - 1))
+
+    d_desc = direct_d_descriptor_dynamic(b, params)
+
+    acc_args = [
+        (f"acc_q{qt}_p{pi}", zero_acc) for qt in range(q_subtiles) for pi in range(p.KH)
     ]
 
-    d_desc = TensorDescriptor.naive(
-        "D",
-        lengths=[p.N, Ho, Wo, p.total_k],
-        coord_names=("n", "h", "w", "k"),
-    )
+    def _acc_index(qt: int, pi: int) -> int:
+        return qt * p.KH + pi
 
-    for y in range(n_iters):
-        cur = A_smem if (y % 2 == 0 or not spec.double_buffer) else B_smem
-        nxt = B_smem if (y % 2 == 0 or not spec.double_buffer) else A_smem
+    for_op = b.scf_for_iter(c0, n_iters_v, c_unroll, acc_args, iv_name="y_row")
+    with for_op as (y_base, loop_accs):
+        accs_flat = list(loop_accs)
 
-        inputs_main_by_q = [lds_read_input_main(qt, cur) for qt in range(q_subtiles)]
-        inputs_s2_by_q = [lds_read_input_s2(qt, cur) for qt in range(q_subtiles)]
+        for j in range(UNROLL):
+            cur = A_smem if (j % 2 == 0 or not spec.double_buffer) else B_smem
+            nxt = B_smem if (j % 2 == 0 or not spec.double_buffer) else A_smem
 
-        loads_next = None
-        if y + 1 < n_iters:
-            loads_next = issue_dram_load(b.const_i32(y + 1))
+            inputs_main_by_q = [
+                lds_read_input_main(qt, cur) for qt in range(q_subtiles)
+            ]
+            inputs_s2_by_q = [lds_read_input_s2(qt, cur) for qt in range(q_subtiles)]
 
-        for qt in range(q_subtiles):
-            accs = acc_tiles[qt]
-            inp_main = inputs_main_by_q[qt]
-            inp_s2 = inputs_s2_by_q[qt]
-            for r_const in range(p.KH):
-                p_idx = (y - r_const) % p.KH
-                acc_in = accs[p_idx]
-                # Main atom: s=0 and s=1 folded into K=16.
-                acc_in = b.mfma_f32_16x16x16_f16(
-                    weights_main[r_const], inp_main, acc_in
-                )
-                # Residual atom: s=2, zero-padded to K=16 (upper lanes carry zeros).
-                acc_in = b.mfma_f32_16x16x16_f16(weights_s2[r_const], inp_s2, acc_in)
-                accs[p_idx] = acc_in
+            # Rows past the image zero-fill through the descriptor bound, so
+            # the next-row prefetch needs no guard.
+            loads_next = issue_dram_load(b.add(y_base, b.const_i32(j + 1)))
 
-        if loads_next is not None:
+            for qt in range(q_subtiles):
+                inp_main = inputs_main_by_q[qt]
+                inp_s2 = inputs_s2_by_q[qt]
+                for r_const in range(p.KH):
+                    # y_base is 0 mod KH, so the rotating slot collapses to j.
+                    p_idx = (j - r_const) % p.KH
+                    flat = _acc_index(qt, p_idx)
+                    acc_in = accs_flat[flat]
+                    # Main atom: s=0 and s=1 folded into K=16.
+                    acc_in = b.mfma_f32_16x16x16_f16(
+                        weights_main[r_const], inp_main, acc_in
+                    )
+                    # Residual atom: s=2, zero-padded to K=16 (upper lanes zero).
+                    acc_in = b.mfma_f32_16x16x16_f16(
+                        weights_s2[r_const], inp_s2, acc_in
+                    )
+                    accs_flat[flat] = acc_in
+
+            # Single-buffer read-after-write guard; see the 16c builder.
             if not spec.double_buffer:
                 b.sync()
             store_to_lds(loads_next, nxt)
-        b.sync()
+            b.sync()
 
-        p_flush_val = y - (p.KH - 1)
-        P_FLUSH = p_flush_val % p.KH
-        if 0 <= p_flush_val < p.H and p_flush_val % c_stride_8c == 0:
-            ho_row = p_flush_val // c_stride_8c
+            P_FLUSH = (j - (p.KH - 1)) % p.KH
+            p_flush_v = b.add(y_base, b.const_i32(j - (p.KH - 1)))
+            row_ok = b.land(b.cmp_ge(p_flush_v, c0), b.cmp_lt(p_flush_v, p_Hi))
+            if c_stride_8c > 1:
+                c_stride_v = b.const_i32(c_stride_8c)
+                row_ok = b.land(row_ok, b.cmp_eq(b.mod(p_flush_v, c_stride_v), c0))
+                ho_row_v = b.div(p_flush_v, c_stride_v)
+            else:
+                ho_row_v = p_flush_v
+            ho_row_v = b.select(row_ok, ho_row_v, c0)
+
             for qt in range(q_subtiles):
-                acc_to_flush = acc_tiles[qt][P_FLUSH]
+                flat = _acc_index(qt, P_FLUSH)
+                acc_to_flush = accs_flat[flat]
                 out_q = b.add(b.add(q_tile_start, b.const_i32(qt * 16)), q_in_lane)
                 out_q_valid = b.cmp_lt(out_q, c_W)
                 # C output layout for mfma_f32_16x16x16_f16 (wave64):
-                #   row = c4 * 4 + slot (slot ∈ {0..3}), col = q_in_lane.
-                # Valid k_out rows: c4 * 4 ∈ {0,4} (c4 ∈ {0,1}, since kpg=8).
-                # c4 ∈ {2,3} → rows 8..15 are out-of-group; never stored.
+                #   row = c4 * 4 + slot (slot in 0..3), col = q_in_lane.
+                # Valid k_out rows: c4 * 4 in {0,4} (c4 in {0,1}, since kpg=8).
+                # c4 in {2,3} -> rows 8..15 are out-of-group; never stored.
                 k_val = b.add(b.mul(g, c_kpg), b.mul(c4, b.const_i32(4)))
                 c4_valid = b.cmp_lt(c4, b.const_i32(p.kpg // 4))
                 d_base, _ = d_desc.offset(
                     b,
                     n=n,
-                    h=b.const_i32(ho_row),
+                    h=ho_row_v,
                     w=out_q,
                     k=k_val,
                 )
                 d_base_bytes = b.mul(d_base, c_half_bytes)
-                store_valid = b.land(out_q_valid, c4_valid)
+                store_valid = b.land(b.land(out_q_valid, c4_valid), row_ok)
                 safe_d_off = b.select(store_valid, d_base_bytes, oob_sentinel)
                 acc_h = b.vec_trunc_f32_to_f16(acc_to_flush)
                 b.buffer_store_vN_f16(d_rsrc, safe_d_off, c0, acc_h, 2)
-        for qt in range(q_subtiles):
-            acc_tiles[qt][P_FLUSH] = zero_acc
+                accs_flat[flat] = zero_acc
+
+        b.scf_yield(*accs_flat)
 
     return b.kernel
 
@@ -1658,6 +1834,9 @@ def is_valid_spec_32c(
     except KeyError as e:
         return False, str(e)
     p = spec.problem
+    why = forward_padding_reason(p)
+    if why is not None:
+        return False, why
     if p.stride != 1:
         return False, f"stride > 1 is not supported (got {p.stride})"
     if p.cpg != 32 or p.kpg != 32:
@@ -1713,12 +1892,15 @@ def build_direct_conv_32c(spec: DirectConv32cSpec, arch: str = "gfx950") -> Kern
     b = IRBuilder(spec.kernel_name())
     b.kernel.attrs["max_workgroup_size"] = THREADS
 
-    A = b.param("A", PtrType(F16, "global"), noalias=True, readonly=True, align=16)
-    Bp = b.param("B", PtrType(F16, "global"), noalias=True, readonly=True, align=16)
-    D = b.param("D", PtrType(F16, "global"), noalias=True, writeonly=True, align=16)
-    A_bytes = b.param("A_bytes", I32)
-    B_bytes = b.param("B_bytes", I32)
-    D_bytes = b.param("D_bytes", I32)
+    params = emit_direct_params(b)
+    A = params["A"]
+    Bp = params["B"]
+    D = params["D"]
+    A_bytes = params["A_bytes"]
+    B_bytes = params["B_bytes"]
+    D_bytes = params["D_bytes"]
+    p_Hi = params["p_Hi"]
+    p_Wo = params["p_Wo"]
 
     c0 = b.const_i32(0)
     c_wave = b.const_i32(WAVE)
@@ -1726,7 +1908,7 @@ def build_direct_conv_32c(spec: DirectConv32cSpec, arch: str = "gfx950") -> Kern
     c_BQ = b.const_i32(BLOCK_Q)
     c_cpg = b.const_i32(p.cpg)
     c_kpg = b.const_i32(p.kpg)
-    c_W = b.const_i32(Wo)
+    c_W = p_Wo  # output-width bound for the store guard (runtime)
     c_BG_cpg = b.const_i32(BLOCK_GROUPS * p.cpg)
     c_half_bytes = b.const_i32(2)
     oob_sentinel = b.const_i32((1 << 31) - 1)
@@ -1826,28 +2008,7 @@ def build_direct_conv_32c(spec: DirectConv32cSpec, arch: str = "gfx950") -> Kern
             }
         )
 
-    a_desc = TensorDescriptor.naive(
-        "A",
-        lengths=[p.N, p.H, p.W, p.total_c],
-        coord_names=("n", "h", "w", "c"),
-    ).transform(
-        embed(
-            upper=("y_iter",),
-            into="h",
-            strides=(1,),
-            offset=-p.PAD,
-            lo=0,
-            hi=p.H,
-        ),
-        embed(
-            upper=("q_pos", "W_lds_pos"),
-            into="w",
-            strides=(p.stride, 1),
-            offset=-p.PAD,
-            lo=0,
-            hi=p.W,
-        ),
-    )
+    a_desc = direct_a_descriptor_dynamic(b, params, pad=p.PAD, stride=p.stride)
 
     c_stride_32c = p.stride
 
@@ -1908,61 +2069,82 @@ def build_direct_conv_32c(spec: DirectConv32cSpec, arch: str = "gfx950") -> Kern
     store_to_lds(issue_dram_load(c0), A_smem)
     b.sync()
 
-    n_iters = p.H + p.KH - 1
-    acc_tiles: List[List[Value]] = [
-        [zero_acc, zero_acc, zero_acc] for _ in range(q_subtiles)
+    # ---- the H-row streaming loop ----
+    # AOT: H is a kernarg. The body is unrolled lcm(2, KH) times so the LDS
+    # ping-pong (period 2) and the accumulator slot rotation (period KH) both
+    # line up with the body boundary. See direct_row_loop_unroll.
+    UNROLL = direct_row_loop_unroll(p.KH)
+    c_unroll = b.const_i32(UNROLL)
+    n_iters_v = b.add(p_Hi, b.const_i32(p.KH - 1))
+
+    d_desc = direct_d_descriptor_dynamic(b, params)
+
+    acc_args = [
+        (f"acc_q{qt}_p{pi}", zero_acc) for qt in range(q_subtiles) for pi in range(p.KH)
     ]
 
-    d_desc = TensorDescriptor.naive(
-        "D",
-        lengths=[p.N, Ho, Wo, p.total_k],
-        coord_names=("n", "h", "w", "k"),
-    )
+    def _acc_index(qt: int, pi: int) -> int:
+        return qt * p.KH + pi
 
-    for y in range(n_iters):
-        cur = A_smem if (y % 2 == 0 or not spec.double_buffer) else B_smem
-        nxt = B_smem if (y % 2 == 0 or not spec.double_buffer) else A_smem
+    for_op = b.scf_for_iter(c0, n_iters_v, c_unroll, acc_args, iv_name="y_row")
+    with for_op as (y_base, loop_accs):
+        accs_flat = list(loop_accs)
 
-        inputs_by_q = [
-            [
-                [lds_read_input(qt, s_const, atom_idx, cur) for atom_idx in range(4)]
-                for s_const in range(p.KW)
+        for j in range(UNROLL):
+            cur = A_smem if (j % 2 == 0 or not spec.double_buffer) else B_smem
+            nxt = B_smem if (j % 2 == 0 or not spec.double_buffer) else A_smem
+
+            inputs_by_q = [
+                [
+                    [
+                        lds_read_input(qt, s_const, atom_idx, cur)
+                        for atom_idx in range(4)
+                    ]
+                    for s_const in range(p.KW)
+                ]
+                for qt in range(q_subtiles)
             ]
-            for qt in range(q_subtiles)
-        ]
 
-        loads_next = None
-        if y + 1 < n_iters:
-            loads_next = issue_dram_load(b.const_i32(y + 1))
+            # Rows past the image zero-fill through the descriptor bound.
+            loads_next = issue_dram_load(b.add(y_base, b.const_i32(j + 1)))
 
-        for qt in range(q_subtiles):
-            accs = acc_tiles[qt]
-            for r_const in range(p.KH):
-                p_idx = (y - r_const) % p.KH
-                acc_in = accs[p_idx]
-                for s_const in range(p.KW):
-                    for atom_idx in range(4):
-                        acc_in = b.mfma_f32_32x32x8_f16(
-                            weights[r_const][s_const][atom_idx],
-                            inputs_by_q[qt][s_const][atom_idx],
-                            acc_in,
-                        )
-                accs[p_idx] = acc_in
+            for qt in range(q_subtiles):
+                for r_const in range(p.KH):
+                    # y_base is 0 mod KH, so the rotating slot collapses to j.
+                    p_idx = (j - r_const) % p.KH
+                    flat = _acc_index(qt, p_idx)
+                    acc_in = accs_flat[flat]
+                    for s_const in range(p.KW):
+                        for atom_idx in range(4):
+                            acc_in = b.mfma_f32_32x32x8_f16(
+                                weights[r_const][s_const][atom_idx],
+                                inputs_by_q[qt][s_const][atom_idx],
+                                acc_in,
+                            )
+                    accs_flat[flat] = acc_in
 
-        if loads_next is not None:
+            # Single-buffer read-after-write guard; see the 16c builder.
             if not spec.double_buffer:
                 b.sync()
             store_to_lds(loads_next, nxt)
-        b.sync()
+            b.sync()
 
-        p_flush_val = y - (p.KH - 1)
-        P_FLUSH = p_flush_val % p.KH
-        if 0 <= p_flush_val < p.H and p_flush_val % c_stride_32c == 0:
-            ho_row = p_flush_val // c_stride_32c
+            P_FLUSH = (j - (p.KH - 1)) % p.KH
+            p_flush_v = b.add(y_base, b.const_i32(j - (p.KH - 1)))
+            row_ok = b.land(b.cmp_ge(p_flush_v, c0), b.cmp_lt(p_flush_v, p_Hi))
+            if c_stride_32c > 1:
+                c_stride_v = b.const_i32(c_stride_32c)
+                row_ok = b.land(row_ok, b.cmp_eq(b.mod(p_flush_v, c_stride_v), c0))
+                ho_row_v = b.div(p_flush_v, c_stride_v)
+            else:
+                ho_row_v = p_flush_v
+            ho_row_v = b.select(row_ok, ho_row_v, c0)
+
             for qt in range(q_subtiles):
-                acc_to_flush = acc_tiles[qt][P_FLUSH]
+                flat = _acc_index(qt, P_FLUSH)
+                acc_to_flush = accs_flat[flat]
                 out_q = b.add(b.add(q_tile_start, b.const_i32(qt * 32)), q_in_lane)
-                out_q_valid = b.cmp_lt(out_q, c_W)
+                store_ok = b.land(row_ok, b.cmp_lt(out_q, c_W))
 
                 # C output layout for mfma_f32_32x32x8_f16 (wave64), 16 slots:
                 #   slot i: row = (i//4)*8 + k_blk*4 + (i%4),  col = q_in_lane
@@ -1977,19 +2159,22 @@ def build_direct_conv_32c(spec: DirectConv32cSpec, arch: str = "gfx950") -> Kern
                         d_base, _ = d_desc.offset(
                             b,
                             n=n,
-                            h=b.const_i32(ho_row),
+                            h=ho_row_v,
                             w=out_q,
                             k=k_val,
                         )
                         d_base_bytes = b.mul(d_base, c_half_bytes)
-                        safe_d_off = b.select(out_q_valid, d_base_bytes, oob_sentinel)
+                        safe_d_off = b.select(store_ok, d_base_bytes, oob_sentinel)
                         e0 = b.vec_extract(acc_to_flush, slot0)
                         e1 = b.vec_extract(acc_to_flush, slot1)
                         pair_acc = b.vec_pack([e0, e1], F32)
                         pair_h = b.vec_trunc_f32_to_f16(pair_acc)
                         b.buffer_store_vN_f16(d_rsrc, safe_d_off, c0, pair_h, 1)
-        for qt in range(q_subtiles):
-            acc_tiles[qt][P_FLUSH] = zero_acc
+                accs_flat[flat] = zero_acc
+
+        b.scf_yield(*accs_flat)
+
+    return b.kernel
 
     return b.kernel
 
@@ -2031,13 +2216,24 @@ class DirectConvSpec:
     block_groups: int = 8
     wave_size: int = 64
     double_buffer: bool = True
-    block_h: int = 0  # 0 = no H-tiling; > 0 = tile H (rows per block)
+    # Output rows per block. This is the H-loop trip count, so it is a
+    # build-time capability (like block_q): the loop over rows is unrolled
+    # at build time, while the tile's starting row rides in block_id_z and
+    # the image height is a kernarg. Must be > 0 -- an untiled kernel would
+    # have to bake H into its trip count, which is exactly what AOT forbids.
+    block_h: int = 16
     waves_q: int = 1  # waves along W: all waves process the same Q-tile cooperatively
     waves_k: int = 1  # waves along K-reduction: each wave preloads its K-atom slice
     runtime_k_loop: bool = (
         False  # True = runtime scf.for over K-atoms (low peak VGPR usage)
     )
     persistent_grid: bool = False  # True = always 256 blocks, each iterates over cells
+    # Rounds each persistent block runs. The cell count follows the runtime
+    # shape, but this bounds a build-time-unrolled scf.for, so it is a
+    # declared capability: the kernel can dispatch over at most
+    # persistent_rounds * 256 cells. is_valid_spec rejects a problem that
+    # needs more rather than silently dropping the tail.
+    persistent_rounds: int = 64
     fold_k32: bool = (
         False  # True = use mfma_f32_16x16x32_f16 (2× fewer MFMAs) + LOAD_VEC=8
     )
@@ -2083,8 +2279,15 @@ class DirectConvSpec:
             )
         if self.block_q % 16 != 0:
             raise ValueError("DirectConvSpec block_q must be a multiple of 16")
-        if self.block_h < 0:
-            raise ValueError("DirectConvSpec block_h must be >= 0")
+        if self.persistent_grid and self.persistent_rounds < 1:
+            raise ValueError("DirectConvSpec persistent_rounds must be >= 1")
+        if self.block_h <= 0:
+            raise ValueError(
+                "DirectConvSpec block_h must be > 0: the H-row loop is unrolled "
+                "at build time, so an untiled kernel would have to bake the "
+                "image height into its trip count and could not serve other "
+                "shapes. Pick a tile height (16 is a reasonable default)."
+            )
         if self.fold_k32 and p.cpg % 32 != 0:
             raise ValueError(
                 f"DirectConvSpec fold_k32 requires cpg to be a multiple of 32 (got {p.cpg})"
@@ -2125,6 +2328,9 @@ def is_valid_spec(spec: "DirectConvSpec", arch: str = "gfx950") -> Tuple[bool, s
         return False, str(e)
 
     p = spec.problem
+    why = forward_padding_reason(p)
+    if why is not None:
+        return False, why
     if p.stride != 1:
         return False, f"stride > 1 is not supported (got {p.stride})"
     if p.cpg % 4 != 0 or p.cpg < 4:
@@ -2217,12 +2423,15 @@ def build_direct_conv(spec: "DirectConvSpec", arch: str = "gfx950") -> KernelDef
     b = IRBuilder(spec.kernel_name())
     b.kernel.attrs["max_workgroup_size"] = THREADS
 
-    A = b.param("A", PtrType(F16, "global"), noalias=True, readonly=True, align=16)
-    Bp = b.param("B", PtrType(F16, "global"), noalias=True, readonly=True, align=16)
-    D = b.param("D", PtrType(F16, "global"), noalias=True, writeonly=True, align=16)
-    A_bytes = b.param("A_bytes", I32)
-    B_bytes = b.param("B_bytes", I32)
-    D_bytes = b.param("D_bytes", I32)
+    params = emit_direct_params(b)
+    A = params["A"]
+    Bp = params["B"]
+    D = params["D"]
+    A_bytes = params["A_bytes"]
+    B_bytes = params["B_bytes"]
+    D_bytes = params["D_bytes"]
+    p_Hi = params["p_Hi"]
+    p_Wo = params["p_Wo"]
 
     c0 = b.const_i32(0)
     c1 = b.const_i32(1)
@@ -2231,7 +2440,7 @@ def build_direct_conv(spec: "DirectConvSpec", arch: str = "gfx950") -> KernelDef
     c_BQ = b.const_i32(BLOCK_Q)
     c_cpg = b.const_i32(p.cpg)
     c_kpg = b.const_i32(p.kpg)
-    c_W = b.const_i32(Wo)
+    c_W = p_Wo  # output-width bound for the store guard (runtime)
     c_KW = b.const_i32(p.KW)
     # Runtime K-atom loop now runs only N_K_LOCAL iterations per wave (its slice).
     c_N_K_LOCAL = b.const_i32(N_K_LOCAL)
@@ -2280,19 +2489,29 @@ def build_direct_conv(spec: "DirectConvSpec", arch: str = "gfx950") -> KernelDef
     TOTAL_PERSISTENT = NUM_XCD * BLOCKS_PER_XCD  # = 256
 
     if PERSISTENT:
-        assert BLOCK_H > 0, "persistent_grid requires block_h > 0"
-        n_h_tiles = (p.H + BLOCK_H - 1) // BLOCK_H
-        q_tiles_p = (p.Wo + BLOCK_Q - 1) // BLOCK_Q
-        g_tiles_p = p.groups // BLOCK_GROUPS
-        n_cells_p = p.N * n_h_tiles * q_tiles_p * g_tiles_p  # total cells
+        # Cell counts follow the runtime shape; only the tile geometry
+        # (BLOCK_H / BLOCK_Q / BLOCK_GROUPS) and the XCD topology are
+        # build-time. These are a handful of scalar ops in the prologue.
+        c_block_h_p = b.const_i32(BLOCK_H)
+        n_h_tiles_v = b.div(b.add(p_Hi, b.const_i32(BLOCK_H - 1)), c_block_h_p)
+        q_tiles_p_v = b.div(b.add(p_Wo, b.const_i32(BLOCK_Q - 1)), c_BQ)
+        g_tiles_p_v = b.div(params["p_groups"], c_BG)
+        nhq_v = b.mul(n_h_tiles_v, q_tiles_p_v)
+        nhqg_v = b.mul(nhq_v, g_tiles_p_v)
+        n_cells_v = b.mul(params["p_N"], nhqg_v)
 
         # XCD-aware cell assignment.
-        cells_per_xcd = (n_cells_p + NUM_XCD - 1) // NUM_XCD
-        rounds_per_block = (cells_per_xcd + BLOCKS_PER_XCD - 1) // BLOCKS_PER_XCD
+        cells_per_xcd_v = b.div(
+            b.add(n_cells_v, b.const_i32(NUM_XCD - 1)), b.const_i32(NUM_XCD)
+        )
+        # The per-block round count bounds an scf.for, so it stays build-time:
+        # it is derived from the declared maximum cell count the kernel can
+        # dispatch over rather than from this problem's shape.
+        rounds_per_block = spec.persistent_rounds
 
         xcd_id = b.mod(bx, b.const_i32(NUM_XCD))
         wg_in_xcd = b.div(bx, b.const_i32(NUM_XCD))
-        xcd_start = b.mul(xcd_id, b.const_i32(cells_per_xcd))
+        xcd_start = b.mul(xcd_id, cells_per_xcd_v)
 
         # Placeholders — actual values set inside cell loop body
         n = b.const_i32(0)
@@ -2300,17 +2519,16 @@ def build_direct_conv(spec: "DirectConvSpec", arch: str = "gfx950") -> KernelDef
         q_tile_start_cell = b.const_i32(0)
         g_tile_cell = b.const_i32(0)
     else:
-        # H-tiling: block_h > 0 encodes (n, h_tile) in bz = n*n_h_tiles + h_tile.
-        if BLOCK_H > 0:
-            n_h_tiles = (p.H + BLOCK_H - 1) // BLOCK_H
-            c_n_h_tiles = b.const_i32(n_h_tiles)
-            n = b.div(bz, c_n_h_tiles)
-            h_tile_idx = b.mod(bz, c_n_h_tiles)
-            h_tile_start = b.mul(h_tile_idx, b.const_i32(BLOCK_H))
-        else:
-            n = bz
-            n_h_tiles = 1
-            h_tile_start = None
+        # H-tiling: bz encodes (n, h_tile) as n*n_h_tiles + h_tile. The tile
+        # *height* is a build-time capability, but how many tiles the image
+        # needs follows the runtime height, so the divisor is derived from the
+        # p_Hi kernarg rather than folded in. It is a scalar divide once per
+        # CTA, outside the row loop.
+        c_block_h = b.const_i32(BLOCK_H)
+        c_n_h_tiles = b.div(b.add(p_Hi, b.const_i32(BLOCK_H - 1)), c_block_h)
+        n = b.div(bz, c_n_h_tiles)
+        h_tile_idx = b.mod(bz, c_n_h_tiles)
+        h_tile_start = b.mul(h_tile_idx, c_block_h)
 
     if not PERSISTENT:
         g_tile = by
@@ -2352,28 +2570,7 @@ def build_direct_conv(spec: "DirectConvSpec", arch: str = "gfx950") -> KernelDef
     d_rsrc = b.buffer_rsrc(D, D_bytes)
 
     # A[N, H, W, total_c] NHWC with h and w embeds for padding and boundary.
-    a_desc = TensorDescriptor.naive(
-        "A",
-        lengths=[p.N, p.H, p.W, p.total_c],
-        coord_names=("n", "h", "w", "c"),
-    ).transform(
-        embed(
-            upper=("y_iter",),
-            into="h",
-            strides=(1,),
-            offset=-p.PAD,
-            lo=0,
-            hi=p.H,
-        ),
-        embed(
-            upper=("q_pos", "W_lds_pos"),
-            into="w",
-            strides=(p.stride, 1),
-            offset=-p.PAD,
-            lo=0,
-            hi=p.W,
-        ),
-    )
+    a_desc = direct_a_descriptor_dynamic(b, params, pad=p.PAD, stride=p.stride)
     c_stride_gen = p.stride
 
     b_desc = TensorDescriptor.naive(
@@ -2382,11 +2579,7 @@ def build_direct_conv(spec: "DirectConvSpec", arch: str = "gfx950") -> KernelDef
         coord_names=("k_out", "r", "s", "c"),
     )
 
-    d_desc = TensorDescriptor.naive(
-        "D",
-        lengths=[p.N, Ho, Wo, p.total_k],
-        coord_names=("n", "h", "w", "k"),
-    )
+    d_desc = direct_d_descriptor_dynamic(b, params)
 
     # LDS chunk loader: chunk_idx → (W_lds, group_in_wg, ch_block).
     # ch_block selects LOAD_VEC (4 or 8) channels within the group.
@@ -2479,23 +2672,15 @@ def build_direct_conv(spec: "DirectConvSpec", arch: str = "gfx950") -> KernelDef
         cell_idx = b.add(
             xcd_start, b.add(wg_in_xcd, b.mul(pg_round_iv, b.const_i32(BLOCKS_PER_XCD)))
         )
-        pg_in_bounds = b.cmp_lt(cell_idx, b.const_i32(n_cells_p))
+        pg_in_bounds = b.cmp_lt(cell_idx, n_cells_v)
 
-        c_qt_p = b.const_i32(q_tiles_p)
-        c_nht = b.const_i32(n_h_tiles)
-        c_nhq = b.const_i32(n_h_tiles * q_tiles_p)
-        c_nhqg = b.const_i32(n_h_tiles * q_tiles_p * g_tiles_p)
-
-        pg_g_tile = b.div(cell_idx, c_nhq)  # groups axis (outermost)
-        pg_rem1 = b.mod(cell_idx, c_nhq)
-        pg_n = b.div(pg_rem1, c_nhq)  # actually n is here
-        # Correct decode: cell = n*n_h_tiles*q_tiles + h_tile*q_tiles + q_tile
-        pg_n_v = b.div(cell_idx, b.const_i32(n_h_tiles * q_tiles_p * g_tiles_p))
-        pg_rem_n = b.mod(cell_idx, b.const_i32(n_h_tiles * q_tiles_p * g_tiles_p))
-        pg_gt_v = b.div(pg_rem_n, b.const_i32(n_h_tiles * q_tiles_p))
-        pg_rem_gt = b.mod(pg_rem_n, b.const_i32(n_h_tiles * q_tiles_p))
-        pg_ht_v = b.div(pg_rem_gt, c_qt_p)
-        pg_qt_v = b.mod(pg_rem_gt, c_qt_p)
+        # Decode: cell = n*(nht*qt*gt) + g_tile*(nht*qt) + h_tile*qt + q_tile
+        pg_n_v = b.div(cell_idx, nhqg_v)
+        pg_rem_n = b.mod(cell_idx, nhqg_v)
+        pg_gt_v = b.div(pg_rem_n, nhq_v)
+        pg_rem_gt = b.mod(pg_rem_n, nhq_v)
+        pg_ht_v = b.div(pg_rem_gt, q_tiles_p_v)
+        pg_qt_v = b.mod(pg_rem_gt, q_tiles_p_v)
 
         # For OOB rounds: use cell 0 coordinates (produces zeros, guarded by store_ok).
         n = b.select(pg_in_bounds, pg_n_v, c0)
@@ -2911,7 +3096,7 @@ def build_direct_conv(spec: "DirectConvSpec", arch: str = "gfx950") -> KernelDef
                 # Guard: 0 <= p_flush_global < H (runtime).
                 in_h_range = b.land(
                     b.cmp_ge(p_flush_global, c0),
-                    b.cmp_lt(p_flush_global, b.const_i32(p.H)),
+                    b.cmp_lt(p_flush_global, p_Hi),
                 )
                 # For persistent grid: also gate on this round being in-bounds.
                 if PERSISTENT:
@@ -3452,7 +3637,7 @@ def make_dgrad_fprop_spec(
     problem: "DirectConvProblem",
     block_q: int = 16,
     block_groups: int = 1,
-    block_h: int = 0,
+    block_h: int = 16,
     double_buffer: bool = True,
     waves_q: int = 1,
     waves_k: int = 1,
@@ -3643,17 +3828,24 @@ def build_direct_conv_dgrad(
     b = IRBuilder(spec.kernel_name())
     b.kernel.attrs["max_workgroup_size"] = THREADS
 
-    A = b.param("A", PtrType(F16, "global"), noalias=True, readonly=True, align=16)
-    Bp = b.param("B", PtrType(F16, "global"), noalias=True, readonly=True, align=16)
-    D = b.param("D", PtrType(F16, "global"), noalias=True, writeonly=True, align=16)
-    A_bytes = b.param("A_bytes", I32)
-    B_bytes = b.param("B_bytes", I32)
-    D_bytes = b.param("D_bytes", I32)
+    params = emit_direct_params(b, direction="dgrad")
+    A = params["A"]
+    Bp = params["B"]
+    D = params["D"]
+    A_bytes = params["A_bytes"]
+    B_bytes = params["B_bytes"]
+    D_bytes = params["D_bytes"]
+    p_Hi = params["p_Hi"]
+    p_Wi = params["p_Wi"]
+    # The dY extents bound the gather: an input position only receives a
+    # gradient from output positions that exist, so these are runtime too.
+    p_Ho = params["p_Ho"]
+    p_Wo = params["p_Wo"]
 
     c0 = b.const_i32(0)
     c1 = b.const_i32(1)
-    c_total_c = b.const_i32(p.total_c)
-    c_total_k = b.const_i32(p.total_k)
+    c_total_c = params["p_total_c"]
+    c_total_k = params["p_total_k"]
     c_half_bytes = b.const_i32(2)
     c_wave = b.const_i32(WAVE)
     oob_sentinel = b.const_i32((1 << 31) - 1)
@@ -3683,22 +3875,36 @@ def build_direct_conv_dgrad(
     d_rsrc = b.buffer_rsrc(D, D_bytes)
 
     # dY descriptor: A[N, Ho, Wo, total_k] NHWK (k is contiguous).
-    dy_desc = TensorDescriptor.naive(
-        "A", lengths=[p.N, Ho, Wo, p.total_k], coord_names=("n", "ho", "wo", "k")
+    dy_desc = DynamicTensorDescriptor.create(
+        "dY_nhwk_direct",
+        coord_names=["n", "ho", "wo", "k"],
+        strides=[
+            params["p_dY_stride_n"],
+            params["p_dY_stride_ho"],
+            params["p_dY_stride_wo"],
+            b.const_i32(1),
+        ],
     )
     # W descriptor: B[total_k, KH, KW, cpg] KRSC (c is contiguous).
     b_desc = TensorDescriptor.naive(
         "B", lengths=[p.total_k, p.KH, p.KW, p.cpg], coord_names=("k", "r", "s", "c")
     )
     # dX descriptor: D[N, H, W, total_c] NHWC.
-    d_desc = TensorDescriptor.naive(
-        "D", lengths=[p.N, p.H, p.W, p.total_c], coord_names=("n", "h", "w", "c")
+    d_desc = DynamicTensorDescriptor.create(
+        "dX_nhwc_direct",
+        coord_names=["n", "h", "w", "c"],
+        strides=[
+            params["p_dX_stride_n"],
+            params["p_dX_stride_hi"],
+            params["p_dX_stride_wi"],
+            b.const_i32(1),
+        ],
     )
 
     # Stride between consecutive k_out values in W (in bytes):
     #   W[k+1, r, s, c] - W[k, r, s, c] = KH*KW*cpg * 2 bytes
     k_stride_bytes = b.const_i32(p.KH * p.KW * p.cpg * 2)
-    c_Wi = b.const_i32(p.W)
+    c_Wi = p_Wi
     c_kpg = b.const_i32(p.kpg)
     c_st = b.const_i32(c_stride) if c_stride > 1 else None
 
@@ -3706,7 +3912,7 @@ def build_direct_conv_dgrad(
     # A dummy i32 iter_arg threads through the loop.
     hi_loop = b.scf_for_iter(
         c0,
-        b.const_i32(p.H),
+        p_Hi,
         c1,
         [("dg_hi_dummy", b.const_i32(0))],
         iv_name="dg_hi",
@@ -3727,14 +3933,12 @@ def build_direct_conv_dgrad(
                         b.cmp_ge(hi_p_r, c0),
                         b.land(
                             b.cmp_eq(b.mod(hi_p_r, c_st), c0),
-                            b.cmp_lt(ho, b.const_i32(Ho)),
+                            b.cmp_lt(ho, p_Ho),
                         ),
                     )
                 else:
                     ho = hi_p_r
-                    r_valid = b.land(
-                        b.cmp_ge(hi_p_r, c0), b.cmp_lt(ho, b.const_i32(Ho))
-                    )
+                    r_valid = b.land(b.cmp_ge(hi_p_r, c0), b.cmp_lt(ho, p_Ho))
 
                 for s_const in range(p.KW):
                     wi_p_s = b.add(wi, b.const_i32(p.PAD - s_const))
@@ -3744,14 +3948,12 @@ def build_direct_conv_dgrad(
                             b.cmp_ge(wi_p_s, c0),
                             b.land(
                                 b.cmp_eq(b.mod(wi_p_s, c_st), c0),
-                                b.cmp_lt(wo, b.const_i32(Wo)),
+                                b.cmp_lt(wo, p_Wo),
                             ),
                         )
                     else:
                         wo = wi_p_s
-                        s_valid = b.land(
-                            b.cmp_ge(wi_p_s, c0), b.cmp_lt(wo, b.const_i32(Wo))
-                        )
+                        s_valid = b.land(b.cmp_ge(wi_p_s, c0), b.cmp_lt(wo, p_Wo))
 
                     tap_valid = b.land(b.land(r_valid, s_valid), b.land(c_in_ok, wi_ok))
 
@@ -3936,16 +4138,23 @@ def build_direct_depthwise_dgrad(
     b = IRBuilder(spec.kernel_name())
     b.kernel.attrs["max_workgroup_size"] = THREADS
 
-    A = b.param("A", PtrType(F16, "global"), noalias=True, readonly=True, align=16)
-    Bp = b.param("B", PtrType(F16, "global"), noalias=True, readonly=True, align=16)
-    D = b.param("D", PtrType(F16, "global"), noalias=True, writeonly=True, align=16)
-    A_bytes = b.param("A_bytes", I32)
-    B_bytes = b.param("B_bytes", I32)
-    D_bytes = b.param("D_bytes", I32)
+    params = emit_direct_params(b, direction="dgrad")
+    A = params["A"]
+    Bp = params["B"]
+    D = params["D"]
+    A_bytes = params["A_bytes"]
+    B_bytes = params["B_bytes"]
+    D_bytes = params["D_bytes"]
+    p_Hi = params["p_Hi"]
+    p_Wi = params["p_Wi"]
+    # The dY extents bound the gather: an input position only receives a
+    # gradient from output positions that exist, so these are runtime too.
+    p_Ho = params["p_Ho"]
+    p_Wo = params["p_Wo"]
 
     c0 = b.const_i32(0)
     c1 = b.const_i32(1)
-    c_groups = b.const_i32(p.groups)
+    c_groups = params["p_groups"]
     c_half_bytes = b.const_i32(2)
     c_wave = b.const_i32(WAVE)
     oob_sentinel = b.const_i32((1 << 31) - 1)
@@ -3969,14 +4178,28 @@ def build_direct_depthwise_dgrad(
     b_rsrc = b.buffer_rsrc(Bp, B_bytes)
     d_rsrc = b.buffer_rsrc(D, D_bytes)
 
-    dy_desc = TensorDescriptor.naive(
-        "A", lengths=[p.N, Ho, Wo, p.groups], coord_names=("n", "ho", "wo", "ch")
+    dy_desc = DynamicTensorDescriptor.create(
+        "dY_nhwc_dw",
+        coord_names=["n", "ho", "wo", "ch"],
+        strides=[
+            params["p_dY_stride_n"],
+            params["p_dY_stride_ho"],
+            params["p_dY_stride_wo"],
+            b.const_i32(1),
+        ],
     )
     b_desc = TensorDescriptor.naive(
         "B", lengths=[p.groups, p.KH, p.KW, 1], coord_names=("k", "r", "s", "c")
     )
-    d_desc = TensorDescriptor.naive(
-        "D", lengths=[p.N, p.H, p.W, p.groups], coord_names=("n", "h", "w", "ch")
+    d_desc = DynamicTensorDescriptor.create(
+        "dX_nhwc_dw",
+        coord_names=["n", "h", "w", "ch"],
+        strides=[
+            params["p_dX_stride_n"],
+            params["p_dX_stride_hi"],
+            params["p_dX_stride_wi"],
+            b.const_i32(1),
+        ],
     )
 
     # Preload W[ch, r, s, 0] into registers (KH * KW f32 per lane).
@@ -3992,7 +4215,7 @@ def build_direct_depthwise_dgrad(
             row.append(b.select(ch_in_range, b.cast_to_f32(w_h), zero_f32))
         weights_f32.append(row)
 
-    c_Wi = b.const_i32(p.W)
+    c_Wi = p_Wi
     c_st = b.const_i32(c_stride) if c_stride > 1 else None
 
     # Runtime H-loop: each iteration independently accumulates and stores dX[hi].
@@ -4000,7 +4223,7 @@ def build_direct_depthwise_dgrad(
     # (no actual state crosses iterations — each hi is self-contained).
     hi_loop = b.scf_for_iter(
         c0,
-        b.const_i32(p.H),
+        p_Hi,
         c1,
         [("dg_dw_dummy", b.const_i32(0))],
         iv_name="dg_dw_hi",
@@ -4021,14 +4244,12 @@ def build_direct_depthwise_dgrad(
                         b.cmp_ge(hi_p_r, c0),
                         b.land(
                             b.cmp_eq(b.mod(hi_p_r, c_st), c0),
-                            b.cmp_lt(ho, b.const_i32(Ho)),
+                            b.cmp_lt(ho, p_Ho),
                         ),
                     )
                 else:
                     ho = hi_p_r
-                    r_valid = b.land(
-                        b.cmp_ge(hi_p_r, c0), b.cmp_lt(ho, b.const_i32(Ho))
-                    )
+                    r_valid = b.land(b.cmp_ge(hi_p_r, c0), b.cmp_lt(ho, p_Ho))
 
                 for s_const in range(p.KW):
                     wi_p_s = b.add(wi, b.const_i32(p.PAD - s_const))
@@ -4038,14 +4259,12 @@ def build_direct_depthwise_dgrad(
                             b.cmp_ge(wi_p_s, c0),
                             b.land(
                                 b.cmp_eq(b.mod(wi_p_s, c_st), c0),
-                                b.cmp_lt(wo, b.const_i32(Wo)),
+                                b.cmp_lt(wo, p_Wo),
                             ),
                         )
                     else:
                         wo = wi_p_s
-                        s_valid = b.land(
-                            b.cmp_ge(wi_p_s, c0), b.cmp_lt(wo, b.const_i32(Wo))
-                        )
+                        s_valid = b.land(b.cmp_ge(wi_p_s, c0), b.cmp_lt(wo, p_Wo))
 
                     valid = b.land(b.land(r_valid, s_valid), b.land(ch_in_range, wi_ok))
 
@@ -4186,15 +4405,18 @@ def build_direct_depthwise_dgrad_streaming(
     b = IRBuilder(spec.kernel_name())
     b.kernel.attrs["max_workgroup_size"] = THREADS
 
-    A = b.param("A", PtrType(F16, "global"), noalias=True, readonly=True, align=16)
-    Bp = b.param("B", PtrType(F16, "global"), noalias=True, readonly=True, align=16)
-    D = b.param("D", PtrType(F16, "global"), noalias=True, writeonly=True, align=16)
-    A_bytes = b.param("A_bytes", I32)
-    B_bytes = b.param("B_bytes", I32)
-    D_bytes = b.param("D_bytes", I32)
+    params = emit_direct_params(b, direction="dgrad")
+    A = params["A"]
+    Bp = params["B"]
+    D = params["D"]
+    A_bytes = params["A_bytes"]
+    B_bytes = params["B_bytes"]
+    D_bytes = params["D_bytes"]
+    p_Hi = params["p_Hi"]
+    p_Wi = params["p_Wi"]
 
     c0 = b.const_i32(0)
-    c_groups = b.const_i32(p.groups)
+    c_groups = params["p_groups"]
     c_half_bytes = b.const_i32(2)
     c_wave = b.const_i32(WAVE)
     oob_sentinel = b.const_i32((1 << 31) - 1)
@@ -4219,16 +4441,30 @@ def build_direct_depthwise_dgrad_streaming(
     d_rsrc = b.buffer_rsrc(D, D_bytes)
 
     # dY descriptor: A[N, Ho, Wo, groups] NHWK.
-    dy_desc = TensorDescriptor.naive(
-        "A", lengths=[p.N, Ho, Wo, p.groups], coord_names=("n", "ho", "wo", "ch")
+    dy_desc = DynamicTensorDescriptor.create(
+        "dY_nhwc_dw",
+        coord_names=["n", "ho", "wo", "ch"],
+        strides=[
+            params["p_dY_stride_n"],
+            params["p_dY_stride_ho"],
+            params["p_dY_stride_wo"],
+            b.const_i32(1),
+        ],
     )
     # W descriptor: B[groups, KH, KW, 1] KRSC.
     b_desc = TensorDescriptor.naive(
         "B", lengths=[p.groups, p.KH, p.KW, 1], coord_names=("k", "r", "s", "c")
     )
     # dX descriptor: D[N, H, W, groups] NHWC.
-    d_desc = TensorDescriptor.naive(
-        "D", lengths=[p.N, p.H, p.W, p.groups], coord_names=("n", "h", "w", "ch")
+    d_desc = DynamicTensorDescriptor.create(
+        "dX_nhwc_dw",
+        coord_names=["n", "h", "w", "ch"],
+        strides=[
+            params["p_dX_stride_n"],
+            params["p_dX_stride_hi"],
+            params["p_dX_stride_wi"],
+            b.const_i32(1),
+        ],
     )
 
     # Preload W[ch, r, s, 0] into f32 registers (KH*KW values per thread).
@@ -4244,99 +4480,118 @@ def build_direct_depthwise_dgrad_streaming(
             row.append(b.select(ch_ok, b.cast_to_f32(w_h), zero_f32))
         weights_f32.append(row)
 
-    # Circular accumulator slots: acc_slots[slot][j] for slot in [0, n_slots) and j in [0, BLOCK_W).
-    # Each slot corresponds to hi % n_slots, accumulating one (hi, wi) pair's partial dX sum.
-    acc_slots: List[List[Value]] = [[zero_f32] * BLOCK_W for _ in range(n_slots)]
+    # Circular accumulator slots, one per (hi % n_slots, wi) pair: each holds a
+    # partial dX sum while later output rows are still contributing to it.
+    c_Wi = p_Wi
+    c_Wo = params["p_Wo"]
+    c_Ho = params["p_Ho"]
 
-    c_Wi = b.const_i32(p.W)
-    c_Wo = b.const_i32(Wo)
+    # ---- ho-streaming loop ----
+    # Row ``y`` accumulates every dY tap that lands in dX rows
+    # ``[y*stride - PAD, (y+1)*stride - PAD)`` and then flushes that window.
+    # A dX row hi receives its last contribution at ``y = (hi + PAD) // stride``,
+    # which is exactly the row whose window contains it, so accumulate-then-flush
+    # per row needs no lookahead.
+    #
+    # AOT: H (and therefore Ho) is a kernarg. The slot index
+    # ``hi % (stride*KH)`` is periodic in y with period KH, so unrolling the
+    # body KH times and stepping by KH keeps every slot a Python constant --
+    # the loop variable is then always 0 mod KH, and
+    # ``y_base*stride ≡ 0 (mod stride*KH)`` drops out of the slot arithmetic.
+    #
+    # The loop runs to ceil((H + PAD) / stride) windows, which is what it takes
+    # to cover every dX row. Rows past Ho load nothing (the ho bound below
+    # rejects them) and only flush, so the tail needs no special case; rows
+    # past the rounded-up trip count flush windows entirely outside [0, H),
+    # which the store guard drops.
+    c_stride_v = b.const_i32(stride)
+    c_KH_v = b.const_i32(p.KH)
+    y_end_v = b.div(
+        b.add(b.add(p_Hi, b.const_i32(p.PAD)), b.const_i32(stride - 1)),
+        c_stride_v,
+    )
 
-    # Python-unrolled ho-streaming loop (Ho iterations = half of H for stride=2).
-    for y in range(Ho):
-        y_ho = y  # Python int — ho_iter
+    slot_args = [
+        (f"dgs_acc_s{slot}_w{j}", zero_f32)
+        for slot in range(n_slots)
+        for j in range(BLOCK_W)
+    ]
 
-        # For each (r_const): compute hi = y*stride + r_const - PAD.
-        # If hi is in [0, H): pre-load dY[n, y, *, ch] values needed for this (ho, r).
-        # Then for each (s_const): find wo = (wi + PAD - s_const)//stride, check divisibility.
+    def _slot_index(slot: int, j: int) -> int:
+        return slot * BLOCK_W + j
 
-        for r_const in range(p.KH):
-            hi_int = y_ho * stride + r_const - p.PAD  # Python int
-            if not (0 <= hi_int < p.H):
-                continue
-            slot = hi_int % n_slots
+    # wi is loop-invariant: hoist it and its bound check out of the body.
+    wi_vals = [b.add(wi_tile_start, b.const_i32(j)) for j in range(BLOCK_W)]
+    wi_oks = [b.cmp_lt(wi, c_Wi) for wi in wi_vals]
 
-            for s_const in range(p.KW):
+    for_op = b.scf_for_iter(c0, y_end_v, c_KH_v, slot_args, iv_name="dgs_ho")
+    with for_op as (y_base, loop_slots):
+        slots_flat = list(loop_slots)
+
+        for jj in range(p.KH):
+            y_v = b.add(y_base, b.const_i32(jj))
+            ho_ok = b.cmp_lt(y_v, c_Ho)
+
+            for r_const in range(p.KH):
+                # hi = y*stride + r - PAD. Its slot is static because
+                # y_base*stride is a multiple of n_slots = stride*KH.
+                slot = (jj * stride + r_const - p.PAD) % n_slots
+                hi_v = b.add(b.mul(y_v, c_stride_v), b.const_i32(r_const - p.PAD))
+                hi_ok = b.land(b.cmp_ge(hi_v, c0), b.cmp_lt(hi_v, p_Hi))
+                row_ok = b.land(hi_ok, ho_ok)
+
+                for s_const in range(p.KW):
+                    for j in range(BLOCK_W):
+                        wi = wi_vals[j]
+                        # wo = (wi + PAD - s) / stride, only where it divides.
+                        wi_p_s = b.add(wi, b.const_i32(p.PAD - s_const))
+                        if stride > 1:
+                            div_ok = b.cmp_eq(b.mod(wi_p_s, c_stride_v), c0)
+                            wo = b.div(wi_p_s, c_stride_v)
+                        else:
+                            div_ok = None
+                            wo = wi_p_s
+
+                        wo_ok = b.land(b.cmp_ge(wi_p_s, c0), b.cmp_lt(wo, c_Wo))
+                        tap_valid = b.land(
+                            b.land(wo_ok, row_ok), b.land(ch_ok, wi_oks[j])
+                        )
+                        if stride > 1:
+                            tap_valid = b.land(tap_valid, div_ok)
+
+                        dy_off, _ = dy_desc.offset(b, n=n, ho=y_v, wo=wo, ch=ch)
+                        safe_dy = b.select(
+                            tap_valid, b.mul(dy_off, c_half_bytes), oob_sentinel
+                        )
+                        dy_h = b.buffer_load_f16(a_rsrc, safe_dy, c0)
+                        dy_f32 = b.select(tap_valid, b.cast_to_f32(dy_h), zero_f32)
+
+                        flat = _slot_index(slot, j)
+                        slots_flat[flat] = b.fma(
+                            weights_f32[r_const][s_const], dy_f32, slots_flat[flat]
+                        )
+
+            # Flush this row's window: hi in [y*stride - PAD, +stride).
+            for d in range(stride):
+                slot = (jj * stride - p.PAD + d) % n_slots
+                hi_flush_v = b.add(b.mul(y_v, c_stride_v), b.const_i32(d - p.PAD))
+                hi_flush_ok = b.land(
+                    b.cmp_ge(hi_flush_v, c0), b.cmp_lt(hi_flush_v, p_Hi)
+                )
                 for j in range(BLOCK_W):
-                    # wi = wi_tile_start + j (runtime value)
-                    # wo = (wi + PAD - s_const) / stride — check divisibility
-                    # Since wi_tile_start = bx * BLOCK_W (even when BLOCK_W even),
-                    # parity of wi is determined by j.
-                    # (wi + PAD - s_const) % stride: we check at runtime.
-                    wi_rel_PAD_s = (
-                        j + p.PAD - s_const
-                    )  # Python int relative to wi_tile_start
-                    # wi_tile_start is bx*BLOCK_W; we need (wi_tile_start + wi_rel_PAD_s) % stride.
-                    # This is (bx*BLOCK_W + wi_rel_PAD_s) % stride.
-                    # Since BLOCK_W must be divisible by stride for parity-based tiling to work,
-                    # we check at runtime to handle all cases.
-
-                    wi = b.add(wi_tile_start, b.const_i32(j))
-                    wi_ok = b.cmp_lt(wi, c_Wi)
-
-                    # Runtime divisibility and range check for wo.
-                    wi_p_s = b.add(wi, b.const_i32(p.PAD - s_const))
-                    if stride > 1:
-                        c_st = b.const_i32(stride)
-                        div_ok = b.cmp_eq(b.mod(wi_p_s, c_st), c0)
-                        wo = b.div(wi_p_s, c_st)
-                    else:
-                        div_ok = None
-                        wo = wi_p_s
-
-                    wo_ok = b.land(b.cmp_ge(wi_p_s, c0), b.cmp_lt(wo, c_Wo))
-                    if stride > 1:
-                        tap_valid = b.land(b.land(div_ok, wo_ok), b.land(ch_ok, wi_ok))
-                    else:
-                        tap_valid = b.land(wo_ok, b.land(ch_ok, wi_ok))
-
-                    dy_off, _ = dy_desc.offset(
-                        b, n=n, ho=b.const_i32(y_ho), wo=wo, ch=ch
+                    flat = _slot_index(slot, j)
+                    d_off, _ = d_desc.offset(b, n=n, h=hi_flush_v, w=wi_vals[j], ch=ch)
+                    store_ok = b.land(b.land(ch_ok, wi_oks[j]), hi_flush_ok)
+                    safe_d = b.select(
+                        store_ok, b.mul(d_off, c_half_bytes), oob_sentinel
                     )
-                    safe_dy = b.select(
-                        tap_valid, b.mul(dy_off, c_half_bytes), oob_sentinel
+                    b.buffer_store_f16(
+                        d_rsrc, safe_d, c0, b.trunc_f32_to_f16(slots_flat[flat])
                     )
-                    dy_h = b.buffer_load_f16(a_rsrc, safe_dy, c0)
-                    dy_f32 = b.select(tap_valid, b.cast_to_f32(dy_h), zero_f32)
+                    # Reset the slot for the next wrap.
+                    slots_flat[flat] = zero_f32
 
-                    acc_slots[slot][j] = b.fma(
-                        weights_f32[r_const][s_const], dy_f32, acc_slots[slot][j]
-                    )
-
-        # Flush complete hi values after this ho.
-        # hi is complete when y (= ho) equals y_last(hi) = min(Ho-1, (hi+PAD)//stride).
-        # Case 1 (y < Ho-1): flush hi in [y*stride - PAD, (y+1)*stride - 1 - PAD] ∩ [0, H).
-        # Case 2 (y == Ho-1): flush hi in [(Ho-1)*stride - PAD, H).
-        if y_ho < Ho - 1:
-            flush_start = y_ho * stride - p.PAD
-            flush_end = min(p.H, (y_ho + 1) * stride - p.PAD)
-        else:
-            flush_start = (Ho - 1) * stride - p.PAD
-            flush_end = p.H
-
-        for hi_flush in range(max(0, flush_start), flush_end):
-            slot = hi_flush % n_slots
-            for j in range(BLOCK_W):
-                wi = b.add(wi_tile_start, b.const_i32(j))
-                wi_ok = b.cmp_lt(wi, c_Wi)
-                d_off, _ = d_desc.offset(b, n=n, h=b.const_i32(hi_flush), w=wi, ch=ch)
-                safe_d = b.select(
-                    b.land(ch_ok, wi_ok), b.mul(d_off, c_half_bytes), oob_sentinel
-                )
-                b.buffer_store_f16(
-                    d_rsrc, safe_d, c0, b.trunc_f32_to_f16(acc_slots[slot][j])
-                )
-                # Reset slot for future use.
-                acc_slots[slot][j] = zero_f32
+        b.scf_yield(*slots_flat)
 
     return b.kernel
 
@@ -4420,6 +4675,9 @@ def is_valid_depthwise_spec(
         return False, str(e)
 
     p = spec.problem
+    why = forward_padding_reason(p)
+    if why is not None:
+        return False, why
     if p.cpg != 1 or p.kpg != 1:
         return False, f"cpg and kpg must both be 1 (got cpg={p.cpg}, kpg={p.kpg})"
     return True, "ok"
@@ -4470,17 +4728,20 @@ def build_direct_depthwise(
     b = IRBuilder(spec.kernel_name())
     b.kernel.attrs["max_workgroup_size"] = THREADS
 
-    A = b.param("A", PtrType(F16, "global"), noalias=True, readonly=True, align=16)
-    Bp = b.param("B", PtrType(F16, "global"), noalias=True, readonly=True, align=16)
-    D = b.param("D", PtrType(F16, "global"), noalias=True, writeonly=True, align=16)
-    A_bytes = b.param("A_bytes", I32)
-    B_bytes = b.param("B_bytes", I32)
-    D_bytes = b.param("D_bytes", I32)
+    params = emit_direct_params(b)
+    A = params["A"]
+    Bp = params["B"]
+    D = params["D"]
+    A_bytes = params["A_bytes"]
+    B_bytes = params["B_bytes"]
+    D_bytes = params["D_bytes"]
+    p_Hi = params["p_Hi"]
+    p_Ho = params["p_Ho"]
 
     c0 = b.const_i32(0)
     c_wave = b.const_i32(WAVE)
-    c_W = b.const_i32(Wo)
-    c_groups = b.const_i32(p.groups)
+    c_W = params["p_Wo"]  # output-width bound for the store guard (runtime)
+    c_groups = params["p_groups"]
     c_half_bytes = b.const_i32(2)
     oob_sentinel = b.const_i32((1 << 31) - 1)
     zero_f32 = b.const_f32(0.0)
@@ -4507,27 +4768,8 @@ def build_direct_depthwise(
     d_rsrc = b.buffer_rsrc(D, D_bytes)
 
     # A[N, H, W, C] NHWC descriptor with h and w boundary embeds.
-    a_desc = TensorDescriptor.naive(
-        "A",
-        lengths=[p.N, p.H, p.W, p.total_c],
-        coord_names=("n", "h", "w", "c"),
-    ).transform(
-        embed(
-            upper=("y_iter",),
-            into="h",
-            strides=(1,),
-            offset=-p.PAD,
-            lo=0,
-            hi=p.H,
-        ),
-        embed(
-            upper=("wo", "s_off"),
-            into="w",
-            strides=(p.stride, 1),
-            offset=-p.PAD,
-            lo=0,
-            hi=p.W,
-        ),
+    a_desc = direct_a_descriptor_dynamic(
+        b, params, pad=p.PAD, stride=p.stride, w_upper=("wo", "s_off")
     )
 
     # B[total_k, KH, KW, 1] KRSC descriptor (cpg=1: last dim is always 0).
@@ -4538,11 +4780,7 @@ def build_direct_depthwise(
     )
 
     # D[N, Ho, Wo, total_k] NHWK descriptor.
-    d_desc = TensorDescriptor.naive(
-        "D",
-        lengths=[p.N, Ho, Wo, p.total_k],
-        coord_names=("n", "h", "w", "k"),
-    )
+    d_desc = direct_d_descriptor_dynamic(b, params)
 
     # ---- Preload weights into registers (KH * KW fp16 → f32 values per lane) ----
     # Each lane owns one channel (ch), so weight[ch, r, s, 0] is a scalar.
@@ -4568,13 +4806,13 @@ def build_direct_depthwise(
     acc: List[List[Value]] = [[zero_f32] * p.KH for _ in range(BLOCK_W)]
 
     # ---- H-streaming loop ----
-    # Below _DW_UNROLL_THRESH the loop is Python-unrolled (best codegen).
-    # Above it a runtime grouped-period scf.for is used: the outer loop
-    # runs n_groups = ceil(n_iters/KH) times; the inner KH steps are
-    # Python-unrolled with STATIC slot indices so preloaded weights are
-    # referenced directly (no scatter, no runtime weight loads).
-    n_iters = p.H + p.KH - 1
-    _use_unroll = n_iters * BLOCK_W * p.KH * p.KW <= _DW_UNROLL_THRESH
+    # AOT: the row count follows the runtime height, so only the
+    # grouped-period scf.for form is usable -- the Python-unrolled variant
+    # would bake H into the trip count. The outer loop runs
+    # n_groups = ceil(n_iters / KH) times and the inner KH steps are unrolled
+    # with STATIC slot indices, so the preloaded weights are still referenced
+    # directly (no scatter, no runtime weight loads).
+    _use_unroll = False
 
     if _use_unroll:
         for y in range(n_iters):
@@ -4627,7 +4865,9 @@ def build_direct_depthwise(
         c1 = b.const_i32(1)
         c_KH = b.const_i32(p.KH)
         c_stride_rv = b.const_i32(c_stride_dw)
-        n_groups = (n_iters + p.KH - 1) // p.KH
+        # n_iters = H + KH - 1 rows; the loop walks them KH at a time.
+        n_iters_v = b.add(p_Hi, b.const_i32(p.KH - 1))
+        n_groups_v = b.div(b.add(n_iters_v, b.const_i32(p.KH - 1)), c_KH)
 
         dw_iter_args = [
             (f"dw_acc_kh{kh}_w{w}", zero_f32)
@@ -4636,7 +4876,7 @@ def build_direct_depthwise(
         ]
         group_loop = b.scf_for_iter(
             c0,
-            b.const_i32(n_groups),
+            n_groups_v,
             c1,
             dw_iter_args,
             iv_name="dw_grp",
@@ -4647,7 +4887,7 @@ def build_direct_depthwise(
 
             for j in range(p.KH):
                 y_j = b.add(b.mul(grp_iv, c_KH), b.const_i32(j))
-                j_valid = b.cmp_lt(y_j, b.const_i32(n_iters))
+                j_valid = b.cmp_lt(y_j, n_iters_v)
 
                 for w_out in range(BLOCK_W):
                     w_pos = b.add(q_tile_start, b.const_i32(w_out))
@@ -4787,6 +5027,9 @@ def is_valid_depthwise_spatial_spec(
         return False, str(e)
 
     p = spec.problem
+    why = forward_padding_reason(p)
+    if why is not None:
+        return False, why
     if p.cpg != 1 or p.kpg != 1:
         return False, f"cpg and kpg must both be 1 (got cpg={p.cpg}, kpg={p.kpg})"
     if p.groups > spec.wave_size:
@@ -4820,22 +5063,27 @@ def build_direct_depthwise_spatial(
     Wo = p.Wo
     c_stride_dw = p.stride
 
-    n_iters = p.H + p.KH - 1
-    _use_unroll = n_iters * p.KH * p.KW <= _DW_UNROLL_THRESH
+    # AOT: the row count follows the runtime height, so only the
+    # grouped-period scf.for form is usable; the Python-unrolled variant would
+    # bake H into the trip count.
+    _use_unroll = False
 
     b = IRBuilder(spec.kernel_name())
     b.kernel.attrs["max_workgroup_size"] = THREADS
 
-    A = b.param("A", PtrType(F16, "global"), noalias=True, readonly=True, align=16)
-    Bp = b.param("B", PtrType(F16, "global"), noalias=True, readonly=True, align=16)
-    D = b.param("D", PtrType(F16, "global"), noalias=True, writeonly=True, align=16)
-    A_bytes = b.param("A_bytes", I32)
-    B_bytes = b.param("B_bytes", I32)
-    D_bytes = b.param("D_bytes", I32)
+    params = emit_direct_params(b)
+    A = params["A"]
+    Bp = params["B"]
+    D = params["D"]
+    A_bytes = params["A_bytes"]
+    B_bytes = params["B_bytes"]
+    D_bytes = params["D_bytes"]
+    p_Hi = params["p_Hi"]
 
     c0 = b.const_i32(0)
     c_wave = b.const_i32(WAVE)
-    c_Wo = b.const_i32(Wo)
+    c_groups = params["p_groups"]
+    c_Wo = params["p_Wo"]  # output-width bound for the store guard (runtime)
     c_half_bytes = b.const_i32(2)
     oob_sentinel = b.const_i32((1 << 31) - 1)
     zero_f32 = b.const_f32(0.0)
@@ -4844,8 +5092,8 @@ def build_direct_depthwise_spatial(
     wave_id = b.div(tid, c_wave)
     t_in_wave = b.mod(tid, c_wave)
 
-    ch = b.mod(t_in_wave, b.const_i32(p.groups))
-    w_in_wave = b.div(t_in_wave, b.const_i32(p.groups))
+    ch = b.mod(t_in_wave, c_groups)
+    w_in_wave = b.div(t_in_wave, c_groups)
 
     bx = b.block_id_x()
     n = b.block_id_z()
@@ -4863,27 +5111,13 @@ def build_direct_depthwise_spatial(
     b_rsrc = b.buffer_rsrc(Bp, B_bytes)
     d_rsrc = b.buffer_rsrc(D, D_bytes)
 
-    a_desc = TensorDescriptor.naive(
-        "A",
-        lengths=[p.N, p.H, p.W, p.total_c],
-        coord_names=("n", "h", "w", "c"),
-    ).transform(
-        embed(upper=("y_iter",), into="h", strides=(1,), offset=-p.PAD, lo=0, hi=p.H),
-        embed(
-            upper=("wo", "s_off"),
-            into="w",
-            strides=(p.stride, 1),
-            offset=-p.PAD,
-            lo=0,
-            hi=p.W,
-        ),
+    a_desc = direct_a_descriptor_dynamic(
+        b, params, pad=p.PAD, stride=p.stride, w_upper=("wo", "s_off")
     )
     b_desc = TensorDescriptor.naive(
         "B", lengths=[p.total_k, p.KH, p.KW, 1], coord_names=("k", "r", "s", "c")
     )
-    d_desc = TensorDescriptor.naive(
-        "D", lengths=[p.N, Ho, Wo, p.total_k], coord_names=("n", "h", "w", "k")
-    )
+    d_desc = direct_d_descriptor_dynamic(b, params)
 
     # Preload weights: KH * KW f32 per thread (one channel each).
     weights_f32: List[List[Value]] = []
@@ -4933,12 +5167,14 @@ def build_direct_depthwise_spatial(
         c1 = b.const_i32(1)
         c_KH = b.const_i32(p.KH)
         c_stride_rv = b.const_i32(c_stride_dw)
-        n_groups = (n_iters + p.KH - 1) // p.KH
+        # n_iters = H + KH - 1 rows; the loop walks them KH at a time.
+        n_iters_v = b.add(p_Hi, b.const_i32(p.KH - 1))
+        n_groups_v = b.div(b.add(n_iters_v, b.const_i32(p.KH - 1)), c_KH)
 
         iter_args = [(f"sp_acc_{kh}", zero_f32) for kh in range(p.KH)]
         group_loop = b.scf_for_iter(
             c0,
-            b.const_i32(n_groups),
+            n_groups_v,
             c1,
             iter_args,
             iv_name="sp_grp",
@@ -4949,7 +5185,7 @@ def build_direct_depthwise_spatial(
 
             for j in range(p.KH):
                 y_j = b.add(b.mul(grp_iv, c_KH), b.const_i32(j))
-                j_valid = b.cmp_lt(y_j, b.const_i32(n_iters))
+                j_valid = b.cmp_lt(y_j, n_iters_v)
 
                 for s_const in range(p.KW):
                     a_off, valid = a_desc.offset(
@@ -4992,3 +5228,66 @@ def build_direct_depthwise_spatial(
             b.scf_yield(*new_accs)
 
     return b.kernel
+
+
+# ---------------------------------------------------------------------------
+# Launch geometry
+# ---------------------------------------------------------------------------
+
+# Blocks a persistent DirectConvSpec kernel is launched with: 8 XCDs x 32
+# workgroups, the same constant the kernel decodes its cells against.
+DIRECT_PERSISTENT_BLOCKS = 256
+
+
+def _ceil_div(a: int, b: int) -> int:
+    return (a + b - 1) // b
+
+
+def direct_launch_geometry(spec) -> Tuple[Tuple[int, int, int], Tuple[int, int, int]]:
+    """``(grid, block)`` for launching ``spec``'s kernel on ``spec.problem``.
+
+    The grid is the host-side half of each kernel's block-id decode, so it
+    lives next to the builders rather than at every launch site: those copies
+    drifted when ``DirectConvSpec`` gained H-tiling (``bz`` became
+    ``n * n_h_tiles + h_tile``) and the call sites kept launching ``N`` blocks
+    along z, silently computing only the first images' first rows.
+
+    Every kernel here takes the problem's extents as kernargs, so the same
+    compiled binary is launched with whatever grid the *runtime* problem needs.
+    """
+    p = spec.problem
+    if isinstance(spec, DirectConvSpec):
+        if spec.persistent_grid:
+            grid = (DIRECT_PERSISTENT_BLOCKS, 1, 1)
+        else:
+            # The kernel derives the tile count from p_Hi (see build_direct_conv).
+            grid = (
+                _ceil_div(p.Wo, spec.block_q),
+                p.groups // spec.block_groups,
+                p.N * _ceil_div(p.H, spec.block_h),
+            )
+        return grid, (spec.threads_per_block, 1, 1)
+    if isinstance(spec, DirectDepthwiseSpatialSpec):
+        # Every channel of the image lives in one wavefront.
+        return (_ceil_div(p.Wo, spec.block_w), 1, p.N), (spec.threads_per_block, 1, 1)
+    if isinstance(spec, DirectDepthwiseSpec):
+        grid = (_ceil_div(p.Wo, spec.block_w), _ceil_div(p.groups, spec.block_ch), p.N)
+        return grid, (spec.threads_per_block, 1, 1)
+    if isinstance(spec, (DirectDepthwiseDgradStreamSpec, DirectDepthwiseDgradSpec)):
+        # dgrad tiles the gradient's *input* width.
+        grid = (_ceil_div(p.W, spec.block_w), _ceil_div(p.groups, spec.block_ch), p.N)
+        return grid, (spec.threads_per_block, 1, 1)
+    if isinstance(spec, DirectConvDgradSpec):
+        block_ch = spec.block_groups * spec.wave_size
+        grid = (_ceil_div(p.W, spec.block_q), _ceil_div(p.total_c, block_ch), p.N)
+        return grid, (spec.threads_per_block, 1, 1)
+    if isinstance(spec, DirectTransposeWeightsDgradSpec):
+        # One (group, r, s) per x, a 64-wide kpg tile per y, one cpg per z.
+        return (p.groups * p.KH * p.KW, _ceil_div(p.kpg, 64), p.cpg), (64, 1, 1)
+    if isinstance(spec, DirectReorganizeWeightsSpec):
+        k_atom = 32 if spec.fold_k32 else 16
+        n_blocks = (
+            p.groups * p.KH * p.KW * _ceil_div(p.kpg, k_atom) * _ceil_div(p.cpg, 16)
+        )
+        return (n_blocks, 1, 1), (64, 1, 1)
+    raise TypeError(f"no launch geometry for {type(spec).__name__}")

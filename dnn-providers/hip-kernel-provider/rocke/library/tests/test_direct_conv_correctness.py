@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import ctypes
 import importlib.util
-import math
 import unittest
 from dataclasses import dataclass
 from typing import List, Tuple
@@ -162,8 +161,10 @@ def _run_grouped_one(arch: str, shape: _Shape) -> Tuple[bool, str]:
     import torch
 
     from rocke import compile_kernel
-    from rocke.helpers.manifest import conv_args_signature
+    from kernels.common.conv_args import ConvArgs
+    from rocke.helpers.manifest import conv_direct_args_signature
     from kernels.common.conv_direct_grouped import (
+        direct_launch_geometry,
         DirectConvProblem,
         DirectConvSpec,
         build_direct_conv,
@@ -224,7 +225,8 @@ def _run_grouped_one(arch: str, shape: _Shape) -> Tuple[bool, str]:
     rt.memcpy_h2d(B_dev, _u8(B_t), B_t.nbytes)
     rt.memset(D_dev, 0, D_t.nbytes)
 
-    sig = conv_args_signature("fp16")
+    sig = conv_direct_args_signature("fp16")
+    _direct_args = ConvArgs.from_problem(p)
     try:
         launcher = KernelLauncher(
             hsaco=artifact.hsaco,
@@ -237,19 +239,16 @@ def _run_grouped_one(arch: str, shape: _Shape) -> Tuple[bool, str]:
         rt.free(D_dev)
         return False, f"kernel load failed: {e}"
 
-    q_tiles = (p.Wo + spec.block_q - 1) // spec.block_q
-    g_tiles = p.groups // spec.block_groups
-    grid = (q_tiles, g_tiles, p.N)
-    block = (spec.threads_per_block, 1, 1)
+    grid, block = direct_launch_geometry(spec)
 
-    values = {
-        "A": A_dev,
-        "B": B_dev,
-        "D": D_dev,
-        "A_bytes": A_t.nbytes,
-        "B_bytes": B_t.nbytes,
-        "D_bytes": D_t.nbytes,
-    }
+    values = _direct_args.to_launch_values(
+        int(A_dev),
+        int(B_dev),
+        int(D_dev),
+        A_t.nbytes,
+        B_t.nbytes,
+        D_t.nbytes,
+    )
     launcher(values, config=LaunchConfig(grid=grid, block=block, fence=True))
 
     D_cpu = torch.empty_like(D_t)
@@ -284,8 +283,10 @@ def _run_depthwise_one(arch: str, shape: _Shape) -> Tuple[bool, str]:
     import torch
 
     from rocke import compile_kernel
-    from rocke.helpers.manifest import conv_args_signature
+    from kernels.common.conv_args import ConvArgs
+    from rocke.helpers.manifest import conv_direct_args_signature
     from kernels.common.conv_direct_grouped import (
+        direct_launch_geometry,
         DirectConvProblem,
         DirectDepthwiseSpec,
         build_direct_depthwise,
@@ -346,7 +347,8 @@ def _run_depthwise_one(arch: str, shape: _Shape) -> Tuple[bool, str]:
     rt.memcpy_h2d(B_dev, _u8(B_t), B_t.nbytes)
     rt.memset(D_dev, 0, D_t.nbytes)
 
-    sig = conv_args_signature("fp16")
+    sig = conv_direct_args_signature("fp16")
+    _direct_args = ConvArgs.from_problem(p)
     try:
         launcher = KernelLauncher(
             hsaco=artifact.hsaco,
@@ -359,19 +361,16 @@ def _run_depthwise_one(arch: str, shape: _Shape) -> Tuple[bool, str]:
         rt.free(D_dev)
         return False, f"kernel load failed: {e}"
 
-    q_tiles = math.ceil(p.W / spec.block_w)
-    g_tiles = math.ceil(p.groups / spec.block_ch)
-    grid = (q_tiles, g_tiles, p.N)
-    block = (spec.threads_per_block, 1, 1)
+    grid, block = direct_launch_geometry(spec)
 
-    values = {
-        "A": A_dev,
-        "B": B_dev,
-        "D": D_dev,
-        "A_bytes": A_t.nbytes,
-        "B_bytes": B_t.nbytes,
-        "D_bytes": D_t.nbytes,
-    }
+    values = _direct_args.to_launch_values(
+        int(A_dev),
+        int(B_dev),
+        int(D_dev),
+        A_t.nbytes,
+        B_t.nbytes,
+        D_t.nbytes,
+    )
     launcher(values, config=LaunchConfig(grid=grid, block=block, fence=True))
 
     D_cpu = torch.empty_like(D_t)
@@ -407,8 +406,10 @@ def _run_depthwise_spatial_one(arch: str, shape: _Shape) -> Tuple[bool, str]:
     import torch
 
     from rocke import compile_kernel
-    from rocke.helpers.manifest import conv_args_signature
+    from kernels.common.conv_args import ConvArgs
+    from rocke.helpers.manifest import conv_direct_args_signature
     from kernels.common.conv_direct_grouped import (
+        direct_launch_geometry,
         DirectConvProblem,
         DirectDepthwiseSpatialSpec,
         build_direct_depthwise_spatial,
@@ -469,7 +470,8 @@ def _run_depthwise_spatial_one(arch: str, shape: _Shape) -> Tuple[bool, str]:
     rt.memcpy_h2d(B_dev, _u8(B_t), B_t.nbytes)
     rt.memset(D_dev, 0, D_t.nbytes)
 
-    sig = conv_args_signature("fp16")
+    sig = conv_direct_args_signature("fp16")
+    _direct_args = ConvArgs.from_problem(p)
     try:
         launcher = KernelLauncher(
             hsaco=artifact.hsaco,
@@ -482,18 +484,16 @@ def _run_depthwise_spatial_one(arch: str, shape: _Shape) -> Tuple[bool, str]:
         rt.free(D_dev)
         return False, f"kernel load failed: {e}"
 
-    q_tiles = math.ceil(p.Wo / spec.block_w)
-    grid = (q_tiles, 1, p.N)
-    block = (spec.threads_per_block, 1, 1)
+    grid, block = direct_launch_geometry(spec)
 
-    values = {
-        "A": A_dev,
-        "B": B_dev,
-        "D": D_dev,
-        "A_bytes": A_t.nbytes,
-        "B_bytes": B_t.nbytes,
-        "D_bytes": D_t.nbytes,
-    }
+    values = _direct_args.to_launch_values(
+        int(A_dev),
+        int(B_dev),
+        int(D_dev),
+        A_t.nbytes,
+        B_t.nbytes,
+        D_t.nbytes,
+    )
     launcher(values, config=LaunchConfig(grid=grid, block=block, fence=True))
 
     D_cpu = torch.empty_like(D_t)
@@ -611,6 +611,10 @@ _DGRAD_SHAPES: List[_Shape] = [
     ),
     # Grouped stride-2: non-unit stride grouped dgrad.
     _Shape("dg_16c_N2H8W8_g8_s2", N=2, H=8, W=8, groups=8, cpg=16, stride=2),
+    # Padding other than "same": the dgrad kernels bound their rows by p_Ho,
+    # so the AOT cache offers them for every PAD in [0, KH-1].
+    _Shape("dg_8c_N2H9W9_g8_p0_s2", N=2, H=9, W=9, groups=8, cpg=8, PAD=0, stride=2),
+    _Shape("dg_8c_N2H8W8_g8_p2", N=2, H=8, W=8, groups=8, cpg=8, PAD=2),
 ]
 
 # Depthwise dgrad shapes (cpg=kpg=1).  Stride-2 exercises the divisibility
@@ -618,6 +622,20 @@ _DGRAD_SHAPES: List[_Shape] = [
 _DW_DGRAD_SHAPES: List[_Shape] = [
     _Shape("dw_dgrad_s1_N2H14W14_g64", N=2, H=14, W=14, groups=64, cpg=1, stride=1),
     _Shape("dw_dgrad_s2_N2H14W14_g64", N=2, H=14, W=14, groups=64, cpg=1, stride=2),
+    # Padding other than "same" and a larger filter (see _DGRAD_SHAPES).
+    _Shape("dw_dgrad_k3p0_N2H14W14_g64", N=2, H=14, W=14, groups=64, cpg=1, PAD=0),
+    _Shape(
+        "dw_dgrad_k5p4_s2_N2H14W14_g64",
+        N=2,
+        H=14,
+        W=14,
+        groups=64,
+        cpg=1,
+        KH=5,
+        KW=5,
+        PAD=4,
+        stride=2,
+    ),
 ]
 
 
@@ -626,12 +644,13 @@ def _run_dgrad_one(arch: str, shape: _Shape) -> Tuple[bool, str]:
 
     Returns ``(passed, reason)``.
     """
-    import math
     import torch
 
     from rocke import compile_kernel
-    from rocke.helpers.manifest import conv_args_signature
+    from kernels.common.conv_args import ConvArgs
+    from rocke.helpers.manifest import conv_direct_args_signature
     from kernels.common.conv_direct_grouped import (
+        direct_launch_geometry,
         DirectConvDgradSpec,
         DirectConvProblem,
         build_direct_conv_dgrad,
@@ -709,7 +728,8 @@ def _run_dgrad_one(arch: str, shape: _Shape) -> Tuple[bool, str]:
     rt.memcpy_h2d(W_dev, _u8(W), W.nbytes)
     rt.memset(dX_dev, 0, dX.nbytes)
 
-    sig = conv_args_signature("fp16")
+    sig = conv_direct_args_signature("fp16", direction="dgrad")
+    _direct_args = ConvArgs.from_problem(p, direction="dgrad")
     try:
         launcher = KernelLauncher(
             hsaco=artifact.hsaco,
@@ -722,21 +742,16 @@ def _run_dgrad_one(arch: str, shape: _Shape) -> Tuple[bool, str]:
         rt.free(dX_dev)
         return False, f"kernel load failed: {e}"
 
-    # Grid: (ceil(Wi / block_q), ceil(total_c / block_ch), N)
-    block_ch = spec.block_groups * spec.wave_size
-    q_tiles = math.ceil(p.W / spec.block_q)
-    c_tiles = math.ceil(total_c / block_ch)
-    grid = (q_tiles, c_tiles, p.N)
-    block = (spec.threads_per_block, 1, 1)
+    grid, block = direct_launch_geometry(spec)
 
-    values = {
-        "A": dY_dev,
-        "B": W_dev,
-        "D": dX_dev,
-        "A_bytes": dY.nbytes,
-        "B_bytes": W.nbytes,
-        "D_bytes": dX.nbytes,
-    }
+    values = _direct_args.to_launch_values(
+        int(dY_dev),
+        int(W_dev),
+        int(dX_dev),
+        dY.nbytes,
+        W.nbytes,
+        dX.nbytes,
+    )
     launcher(values, config=LaunchConfig(grid=grid, block=block, fence=True))
 
     dX_cpu = torch.empty_like(dX)
@@ -760,12 +775,13 @@ def _run_dgrad_one(arch: str, shape: _Shape) -> Tuple[bool, str]:
 
 def _run_dw_dgrad_one(arch: str, shape: _Shape) -> Tuple[bool, str]:
     """Build, compile, launch, and verify the direct depthwise dgrad kernel."""
-    import math
     import torch
 
     from rocke import compile_kernel
-    from rocke.helpers.manifest import conv_args_signature
+    from kernels.common.conv_args import ConvArgs
+    from rocke.helpers.manifest import conv_direct_args_signature
     from kernels.common.conv_direct_grouped import (
+        direct_launch_geometry,
         DirectConvProblem,
         DirectDepthwiseDgradSpec,
         build_direct_depthwise_dgrad,
@@ -827,7 +843,8 @@ def _run_dw_dgrad_one(arch: str, shape: _Shape) -> Tuple[bool, str]:
     rt.memcpy_h2d(W_dev, _u8(W), W.nbytes)
     rt.memset(dX_dev, 0, dX.nbytes)
 
-    sig = conv_args_signature("fp16")
+    sig = conv_direct_args_signature("fp16", direction="dgrad")
+    _direct_args = ConvArgs.from_problem(p, direction="dgrad")
     try:
         launcher = KernelLauncher(
             hsaco=artifact.hsaco,
@@ -840,19 +857,16 @@ def _run_dw_dgrad_one(arch: str, shape: _Shape) -> Tuple[bool, str]:
         rt.free(dX_dev)
         return False, f"kernel load failed: {e}"
 
-    q_tiles = math.ceil(p.W / spec.block_w)
-    g_tiles = math.ceil(p.groups / spec.block_ch)
-    grid = (q_tiles, g_tiles, p.N)
-    block = (spec.threads_per_block, 1, 1)
+    grid, block = direct_launch_geometry(spec)
 
-    values = {
-        "A": dY_dev,
-        "B": W_dev,
-        "D": dX_dev,
-        "A_bytes": dY.nbytes,
-        "B_bytes": W.nbytes,
-        "D_bytes": dX.nbytes,
-    }
+    values = _direct_args.to_launch_values(
+        int(dY_dev),
+        int(W_dev),
+        int(dX_dev),
+        dY.nbytes,
+        W.nbytes,
+        dX.nbytes,
+    )
     launcher(values, config=LaunchConfig(grid=grid, block=block, fence=True))
 
     out_host = torch.empty_like(dX)

@@ -82,6 +82,50 @@ static void rocke_conv_make_buffer_resource(rocke_ir_builder_t* b,
  *  order and stashing it into ctx. Returns false (builder error set) on the
  *  spec.validate() / is_valid_spec reject paths or any builder ValueError.
  * ===================================================================== */
+/* The p_N .. p_kpg extent block, shared by all three directions.
+ *
+ * Kernargs pack positionally, so this order is the ABI; it must stay in step
+ * with rocke.helpers.conv_abi._dims(), which is what the Python builders
+ * emit from and the launch signatures are built from. Emitting it once here
+ * rather than three times is what keeps the directions from drifting apart. */
+void rocke_conv_emit_dims_block(rocke_ir_builder_t* b, rocke_conv_build_ctx_t* ctx, bool is_3d)
+{
+    const rocke_type_t* i32 = rocke_i32();
+    ctx->p_N = rocke_b_param(b, "p_N", i32, NULL);
+    ctx->p_Hi = rocke_b_param(b, "p_Hi", i32, NULL);
+    ctx->p_Wi = rocke_b_param(b, "p_Wi", i32, NULL);
+    ctx->p_C = rocke_b_param(b, "p_C", i32, NULL);
+    ctx->p_K = rocke_b_param(b, "p_K", i32, NULL);
+    ctx->p_Y = rocke_b_param(b, "p_Y", i32, NULL);
+    ctx->p_X = rocke_b_param(b, "p_X", i32, NULL);
+    if(is_3d)
+    {
+        ctx->p_Z = rocke_b_param(b, "p_Z", i32, NULL);
+        ctx->p_Di = rocke_b_param(b, "p_Di", i32, NULL);
+    }
+    ctx->p_sH = rocke_b_param(b, "p_sH", i32, NULL);
+    ctx->p_sW = rocke_b_param(b, "p_sW", i32, NULL);
+    ctx->p_pH = rocke_b_param(b, "p_pH", i32, NULL);
+    ctx->p_pW = rocke_b_param(b, "p_pW", i32, NULL);
+    ctx->p_dH = rocke_b_param(b, "p_dH", i32, NULL);
+    ctx->p_dW = rocke_b_param(b, "p_dW", i32, NULL);
+    if(is_3d)
+    {
+        ctx->p_sD = rocke_b_param(b, "p_sD", i32, NULL);
+        ctx->p_pD = rocke_b_param(b, "p_pD", i32, NULL);
+        ctx->p_dD = rocke_b_param(b, "p_dD", i32, NULL);
+    }
+    ctx->p_groups = rocke_b_param(b, "p_groups", i32, NULL);
+    ctx->p_Ho = rocke_b_param(b, "p_Ho", i32, NULL);
+    ctx->p_Wo = rocke_b_param(b, "p_Wo", i32, NULL);
+    if(is_3d)
+    {
+        ctx->p_Do = rocke_b_param(b, "p_Do", i32, NULL);
+    }
+    ctx->p_cpg = rocke_b_param(b, "p_cpg", i32, NULL);
+    ctx->p_kpg = rocke_b_param(b, "p_kpg", i32, NULL);
+}
+
 bool rocke_conv_build_ctx_init(rocke_conv_build_ctx_t* ctx,
                                rocke_ir_builder_t* b,
                                const rocke_implicit_gemm_conv_spec_t* spec,
@@ -215,6 +259,57 @@ bool rocke_conv_build_ctx_init(rocke_conv_build_ctx_t* ctx,
         ctx->D_bytes = rocke_b_param(b, "D_bytes", rocke_i32(), NULL);
     }
 
+    /* ---- AOT runtime problem-dimension params (mirrors Python AOT block) ---- */
+    {
+        const rocke_type_t* i32 = rocke_i32();
+        const bool is_3d = spec->problem.is_3d;
+        ctx->params_is_3d = is_3d;
+        rocke_conv_emit_dims_block(b, ctx, is_3d);
+        ctx->p_K_gemm = rocke_b_param(b, "p_K_gemm", i32, NULL);
+        ctx->p_M = rocke_b_param(b, "p_M", i32, NULL);
+        ctx->p_A_stride_n = rocke_b_param(b, "p_A_stride_n", i32, NULL);
+        if(is_3d)
+            ctx->p_A_stride_di = rocke_b_param(b, "p_A_stride_di", i32, NULL);
+        ctx->p_A_stride_hi = rocke_b_param(b, "p_A_stride_hi", i32, NULL);
+        ctx->p_A_stride_wi = rocke_b_param(b, "p_A_stride_wi", i32, NULL);
+        ctx->p_B_stride_k = rocke_b_param(b, "p_B_stride_k", i32, NULL);
+        if(is_3d)
+            ctx->p_B_stride_z = rocke_b_param(b, "p_B_stride_z", i32, NULL);
+        ctx->p_B_stride_y = rocke_b_param(b, "p_B_stride_y", i32, NULL);
+        ctx->p_B_stride_x = rocke_b_param(b, "p_B_stride_x", i32, NULL);
+        ctx->p_D_stride_n = rocke_b_param(b, "p_D_stride_n", i32, NULL);
+        if(is_3d)
+            ctx->p_D_stride_do = rocke_b_param(b, "p_D_stride_do", i32, NULL);
+        ctx->p_D_stride_ho = rocke_b_param(b, "p_D_stride_ho", i32, NULL);
+        ctx->p_D_stride_wo = rocke_b_param(b, "p_D_stride_wo", i32, NULL);
+        /* m -> (n, [do,] ho, wo): divisors Wo, Ho[, Do] -- outermost last. */
+        if(is_3d)
+        {
+            ctx->p_magic_m_Do_mult = rocke_b_param(b, "p_magic_m_Do_mult", i32, NULL);
+            ctx->p_magic_m_Do_shift = rocke_b_param(b, "p_magic_m_Do_shift", i32, NULL);
+        }
+        ctx->p_magic_m_Ho_mult = rocke_b_param(b, "p_magic_m_Ho_mult", i32, NULL);
+        ctx->p_magic_m_Ho_shift = rocke_b_param(b, "p_magic_m_Ho_shift", i32, NULL);
+        ctx->p_magic_m_Wo_mult = rocke_b_param(b, "p_magic_m_Wo_mult", i32, NULL);
+        ctx->p_magic_m_Wo_shift = rocke_b_param(b, "p_magic_m_Wo_shift", i32, NULL);
+        /* k -> ([z,] y, x, c): divisors cpg, X[, Y]. */
+        if(is_3d)
+        {
+            ctx->p_magic_k_Y_mult = rocke_b_param(b, "p_magic_k_Y_mult", i32, NULL);
+            ctx->p_magic_k_Y_shift = rocke_b_param(b, "p_magic_k_Y_shift", i32, NULL);
+        }
+        ctx->p_magic_k_X_mult = rocke_b_param(b, "p_magic_k_X_mult", i32, NULL);
+        ctx->p_magic_k_X_shift = rocke_b_param(b, "p_magic_k_X_shift", i32, NULL);
+        ctx->p_magic_k_cpg_mult = rocke_b_param(b, "p_magic_k_cpg_mult", i32, NULL);
+        ctx->p_magic_k_cpg_shift = rocke_b_param(b, "p_magic_k_cpg_shift", i32, NULL);
+        ctx->p_num_pid_m = rocke_b_param(b, "p_num_pid_m", i32, NULL);
+        ctx->p_num_pid_n = rocke_b_param(b, "p_num_pid_n", i32, NULL);
+        /* p_pH_neg / p_pW_neg are emitted inside the A-descriptor builder,
+         * where Python emits them, so the SSA numbering lines up. */
+        ctx->p_pH_neg = NULL;
+        ctx->p_pW_neg = NULL;
+    }
+
     /* ---- resolve op + atom + frag widths ---- (811-815) */
     ctx->op = rocke_conv_resolve_op(b, spec, ctx->arch);
     if(ctx->op == NULL)
@@ -329,33 +424,27 @@ bool rocke_conv_build_ctx_init(rocke_conv_build_ctx_t* ctx,
     /* ---- common geometry constants ---- (843-845) */
     ctx->c0 = rocke_b_const_i32(b, 0);
     ctx->c_block_k = rocke_b_const_i32(b, ctx->block_k);
-    ctx->c_K_gemm = rocke_b_const_i32(b, rocke_conv_problem_k_gemm(ctx->p));
+    /* AOT: c_K_gemm is now the runtime param p_K_gemm (was const_i32(p.K_gemm)) */
+    ctx->c_K_gemm = ctx->p_K_gemm;
 
     /* ---- per-CTA tile origins (chiplet-swizzle aware) ---- (858-879) */
     if(spec->chiplet_swizzle)
     {
-        int num_pid_m = (rocke_conv_problem_m(ctx->p) + ctx->block_m - 1) / ctx->block_m;
-        int num_pid_n = (rocke_conv_problem_n_gemm(ctx->p) + ctx->block_n - 1) / ctx->block_n;
-        rocke_value_t* c_num_pid_n = rocke_b_const_i32(b, num_pid_n);
-        /* wgid_flat = b.add(b.mul(b.block_id_y(), c_num_pid_n), b.block_id_x()).
-         * Python evaluates the add's first arg (b.mul(b.block_id_y(), ...)) fully
-         * before the second (b.block_id_x()): block_id_y -> mul -> block_id_x ->
-         * add. C arg eval order is unspecified, so pin it with temporaries. */
+        /* AOT: use dynamic variant with runtime p_num_pid_m/n params.
+         * Python: chiplet_aware_super_tile_dynamic(b, wgid_flat,
+         *             num_pid_m=p_num_pid_m, num_pid_n=p_num_pid_n, ...) */
         rocke_value_t* bid_y = rocke_b_block_id_y(b);
-        rocke_value_t* mul_y = rocke_b_mul(b, bid_y, c_num_pid_n);
+        rocke_value_t* mul_y = rocke_b_mul(b, bid_y, ctx->p_num_pid_n);
         rocke_value_t* bid_x = rocke_b_block_id_x(b);
         rocke_value_t* wgid_flat = rocke_b_add(b, mul_y, bid_x);
-        /* Python calls the COMPILE-TIME chiplet_aware_super_tile (conv tile
-         * counts are derived from the static problem shape): limit and
-         * num_wgid_in_group are folded consts, not div/mul IR. */
         rocke_super_tile_swizzle_result_t swz
-            = rocke_chiplet_aware_super_tile(b,
-                                             wgid_flat,
-                                             num_pid_m,
-                                             num_pid_n,
-                                             spec->chiplet_wgm,
-                                             spec->chiplet_num_xcds,
-                                             spec->chiplet_chunk_size);
+            = rocke_chiplet_aware_super_tile_dynamic(b,
+                                                     wgid_flat,
+                                                     ctx->p_num_pid_m,
+                                                     ctx->p_num_pid_n,
+                                                     spec->chiplet_wgm,
+                                                     spec->chiplet_num_xcds,
+                                                     spec->chiplet_chunk_size);
         ctx->block_m_off_v = rocke_b_mul(b, swz.row, rocke_b_const_i32(b, ctx->block_m));
         ctx->block_n_off_v = rocke_b_mul(b, swz.col, rocke_b_const_i32(b, ctx->block_n));
         /* grid = dc_replace(grid, block_m_off=..., block_n_off=...) so the
@@ -382,8 +471,8 @@ bool rocke_conv_build_ctx_init(rocke_conv_build_ctx_t* ctx,
         /* Python: group_idx = b.block_id_z(); k_out_group_base = b.mul(group_idx, b.const_i32(kpg))
          * Bind subexpressions in Python's left-to-right order to pin SSA ids. */
         ctx->group_idx = rocke_b_block_id_z(b);
-        rocke_value_t* c_kpg = rocke_b_const_i32(b, rocke_conv_problem_kpg(ctx->p));
-        ctx->k_out_group_base = rocke_b_mul(b, ctx->group_idx, c_kpg);
+        /* AOT: use runtime p_kpg param (was const_i32(p.kpg)) */
+        ctx->k_out_group_base = rocke_b_mul(b, ctx->group_idx, ctx->p_kpg);
     }
     else
     {
@@ -520,24 +609,24 @@ bool rocke_conv_build_ctx_init(rocke_conv_build_ctx_t* ctx,
             ctx->c_M_pw = 0;
             ctx->c_C_pw = 0;
             ctx->c_K_pw = 0;
+            /* AOT: use dynamic descriptor builders with runtime SSA Values.
+             * These mirror Python _make_a_descriptor_dynamic / _make_b_descriptor_dynamic. */
             bool decompose_m = !(overrides != NULL && overrides->a_mhw_index_fn != NULL);
-            ctx->A_desc = rocke_conv_make_a_descriptor(b, ctx->p, decompose_m);
-            ctx->B_desc = rocke_conv_make_b_descriptor(b, ctx->p);
+            ctx->A_desc = (struct rocke_tensor_descriptor*)rocke_conv_make_a_descriptor_dynamic(
+                b, ctx, decompose_m);
+            ctx->B_desc
+                = (struct rocke_tensor_descriptor*)rocke_conv_make_b_descriptor_dynamic(b, ctx);
         }
-        ctx->D_desc = NULL; /* built lazily in the epilogue phase */
+        ctx->D_desc = NULL; /* built below, before the K-loop */
     }
 
-    /* ---- pointwise IR constants (Python lines 987-990, before buffer resources).
-     * Python:  _c_C_ir = b.const_i32(cpg)    <- first
-     *          _c_K_ir = b.const_i32(kpg)    <- second
-     *          _c_M_ir = b.const_i32(M)      <- third
-     *          _always_valid = b.const_i32(1) <- fourth
-     * Emitted here (before buffer_rsrc) so the SSA sequence matches Python. */
+    /* ---- pointwise IR constants: AOT uses runtime params, not const_i32 ---- */
     if(ctx->is_pointwise)
     {
-        ctx->ir_c_C_pw = rocke_b_const_i32(b, ctx->c_C_pw);
-        ctx->ir_c_K_pw = rocke_b_const_i32(b, ctx->c_K_pw);
-        ctx->ir_c_M_pw = rocke_b_const_i32(b, ctx->c_M_pw);
+        /* Python: _c_C_ir = p_cpg, _c_K_ir = p_kpg, _c_M_ir = p_M, _always_valid = 1 */
+        ctx->ir_c_C_pw = ctx->p_cpg;
+        ctx->ir_c_K_pw = ctx->p_kpg;
+        ctx->ir_c_M_pw = ctx->p_M;
         ctx->ir_always_valid = rocke_b_const_i32(b, 1);
     }
     else
@@ -611,6 +700,7 @@ bool rocke_conv_build_ctx_init(rocke_conv_build_ctx_t* ctx,
 
         /* Wavelet local state: load_tid, is_math, K_iters, epi_barriers. */
         ctx->wavelet_n_math_warps = spec->warp_m * spec->warp_n;
+        ctx->wavelet_math_block_size = rocke_implicit_gemm_conv_spec_block_size(spec);
         ctx->wavelet_K_iters
             = (rocke_conv_problem_k_gemm(ctx->p) + ctx->block_k - 1) / ctx->block_k;
         /* epi_barriers = (no_alias ? 0 : war_barriers) + 1 (RAW), war_barriers=2 for wavelet.
@@ -625,14 +715,12 @@ bool rocke_conv_build_ctx_init(rocke_conv_build_ctx_t* ctx,
         else
             ctx->wavelet_epi_barriers = 0;
 
-        rocke_value_t* c_nmath = rocke_b_const_i32(b, ctx->wavelet_n_math_warps);
-        /* warp_id is tid/wave_size — a VGPR. Materialise as a scalar via readfirstlane
-         * so the branch lowers to s_cmp + s_cbranch (uniform), not v_cmpx (exec-masked),
-         * which would make barrier placement inside the branch accidentally legal. */
-        rocke_value_t* warp_id_s = rocke_b_readfirstlane(b, ctx->warp_id);
-        ctx->wavelet_is_math = rocke_b_cmp_lt(b, warp_id_s, c_nmath);
-        ctx->wavelet_load_tid = rocke_b_sub(
-            b, ctx->tid, rocke_b_const_i32(b, rocke_implicit_gemm_conv_spec_block_size(spec)));
+        /* is_math / load_tid are emitted by the wavelet driver itself, not
+         * here: Python computes them at the top of emit_wavelet_kloop_dynamic,
+         * which runs *after* the D descriptor is built, so emitting them in
+         * the prologue would shift every SSA id in between. */
+        ctx->wavelet_is_math = NULL;
+        ctx->wavelet_load_tid = NULL;
     }
     else
     {
@@ -711,40 +799,72 @@ rocke_kernel_def_t* rocke_build_implicit_gemm_conv(rocke_ir_builder_t* b,
         return NULL;
     }
 
+    /* ---- D descriptor (before the K-loop) ----
+     *
+     * Python builds the D descriptor and the d_addr closure ahead of the
+     * K-loop so the wavelet driver, whose epilogue is emitted from inside the
+     * math-wave region, shares the straight-line drivers' store code. The
+     * descriptor's stride constant is therefore emitted before the loop, and
+     * building it lazily in the epilogue would shift every SSA id in between.
+     */
+    if(ctx.is_pointwise)
+    {
+        /* Python: _always_valid_d = b.const_i32(1), used as the pointwise
+         * d_addr's validity. */
+        ctx.d_k_out_group_base = NULL;
+        ctx.ir_always_valid_d = rocke_b_const_i32(b, 1);
+    }
+    else
+    {
+        ctx.D_desc = (struct rocke_tensor_descriptor*)rocke_conv_make_d_descriptor_dynamic(b, &ctx);
+        /* Grouped conv: the per-warp N coord is within-group (n < kpg);
+         * recover the absolute NHWK filter k_out = g*kpg + n.
+         * Python binds block_id_z() before the multiply, so pin the order. */
+        if(ctx.p->groups > 1)
+        {
+            rocke_value_t* bid_z = rocke_b_block_id_z(b);
+            ctx.d_k_out_group_base = rocke_b_mul(b, bid_z, ctx.p_kpg);
+        }
+        else
+        {
+            ctx.d_k_out_group_base = NULL;
+        }
+        ctx.ir_always_valid_d = NULL;
+    }
+
     /* ---- K-loop driver selection (1276-1347) ----
      *
      * The driver is chosen by K-loop *structure*, not by pipeline name.
-     * "mem", "compv3", and "compv4" all use the same scf.for_iter shape
+     * "mem", "compv3" and "compv4" all use the same scf.for_iter shape
      * (load->sync->mfma->sync per tile) and therefore share kloop_simple.
-     * Their behavioural differences (scheduling hints, double-buffering) are
-     * encoded in ctx->schedule and ctx->double_buffer, which are consulted
-     * inside emit_mfma_phase and the LDS allocation respectively -- no
-     * K-loop structural change is needed for those pipelines.
+     * Their behavioural differences (scheduling hints) are encoded in
+     * ctx->schedule, which is consulted inside emit_mfma_phase -- no K-loop
+     * structural change is needed for those pipelines.
      *
      * A new driver is only justified when the K-loop itself has a different
      * shape that cannot be expressed inside kloop_simple:
      *
-     *   unroll_k     -> kloop_unroll  (Python-unrolled prologue+ping-pong;
-     *                                  2 LDS buffers; no scf.for_iter)
-     *   pipeline="basic"-> kloop_basic (split global_read/lds_write;
-     *                                   single LDS buffer; no scf.for_iter;
-     *                                   VMEM/compute overlap without double-buf)
-     *   else no async -> kloop_simple (scf.for_iter; mem/compv3/compv4 all
-     *                                  share this; pipeline string only
-     *                                  affects schedule hints inside mfma)
+     *   unroll_k     -> kloop_unroll  (2x-unrolled ping-pong body over two
+     *                                  LDS buffers)
+     *   pipeline="basic" -> kloop_basic (split global_read / lds_write so the
+     *                                  VMEM fetch overlaps compute on a single
+     *                                  LDS buffer)
+     *   else no async -> kloop_simple (scf.for_iter; mem/compv3/compv4 share
+     *                                  this; the pipeline string only affects
+     *                                  schedule hints inside mfma)
      *   else (async)  -> kloop_async  (SoftwarePipeline.run_ping_pong over
      *                                  AsyncTileLoader; no scf.for_iter) */
     if(spec->unroll_k)
     {
         rocke_conv_emit_kloop_unroll(&ctx);
     }
-    else if(spec->pipeline != NULL && strcmp(spec->pipeline, "basic") == 0)
-    {
-        rocke_conv_emit_kloop_basic(&ctx);
-    }
     else if(spec->pipeline != NULL && strcmp(spec->pipeline, "wavelet") == 0)
     {
         rocke_conv_emit_kloop_wavelet(&ctx);
+    }
+    else if(spec->pipeline != NULL && strcmp(spec->pipeline, "basic") == 0)
+    {
+        rocke_conv_emit_kloop_basic(&ctx);
     }
     else if(!ctx.async_dma)
     {

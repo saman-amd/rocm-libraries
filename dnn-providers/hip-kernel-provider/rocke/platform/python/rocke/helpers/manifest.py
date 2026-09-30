@@ -57,6 +57,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from .compile import KernelArtifact
+from .conv_abi import conv_arg_names, conv_direct_arg_names
 
 
 MANIFEST_SCHEMA = "ck.dsl.example.manifest/v1"
@@ -67,6 +68,7 @@ __all__ = [
     "MANIFEST_SCHEMA",
     "attention_args_signature",
     "conv_args_signature",
+    "conv_direct_args_signature",
     "engine_build_id",
     "engine_version",
     "gemm_args_signature",
@@ -150,19 +152,74 @@ def gemm_args_signature(*, with_bytes: bool = False) -> List[Dict[str, Any]]:
     return sig
 
 
-def conv_args_signature(dtype: str = "fp16") -> List[Dict[str, Any]]:
-    """Conv kernel args signature: A, B, D ptrs + A_bytes/B_bytes/D_bytes."""
-    _dtype_map = {"fp16": "f16", "bf16": "bf16", "fp32": "f32"}
-    ir_type = _dtype_map.get(dtype, dtype)
-    ptr_type = f"ptr<{ir_type}, global>"
-    return [
-        {"name": "A", "type": ptr_type, "size_bytes": 8},
-        {"name": "B", "type": ptr_type, "size_bytes": 8},
-        {"name": "D", "type": ptr_type, "size_bytes": 8},
-        {"name": "A_bytes", "type": "i32", "size_bytes": 4},
-        {"name": "B_bytes", "type": "i32", "size_bytes": 4},
-        {"name": "D_bytes", "type": "i32", "size_bytes": 4},
-    ]
+def _conv_signature(
+    arg_names, dtype_a: str, dtype_b: str, dtype_d: str
+) -> List[Dict[str, Any]]:
+    """Turn an ordered :mod:`rocke.helpers.conv_abi` name list into a
+    launch signature.
+
+    The name list is the ABI; this only attaches manifest types to it, so the
+    signature can never drift from what the kernel builders declare.
+    """
+    _ir = {"fp16": "f16", "bf16": "bf16", "fp32": "f32"}
+
+    def _ptr(dt: str) -> str:
+        return f"ptr<{_ir.get(dt, dt)}, global>"
+
+    kind_to_type = {
+        "a": _ptr(dtype_a),
+        "b": _ptr(dtype_b),
+        "d": _ptr(dtype_d),
+        "f32*": "ptr<f32, global>",
+        "i32*": "ptr<i32, global>",
+        "i32": "i32",
+    }
+    out: List[Dict[str, Any]] = []
+    for name, kind in arg_names:
+        ty = kind_to_type[kind]
+        out.append({"name": name, "type": ty, "size_bytes": 4 if ty == "i32" else 8})
+    return out
+
+
+def conv_args_signature(
+    dtype: str = "fp16",
+    *,
+    direction: str = "fwd",
+    dtype_b: Optional[str] = None,
+    dtype_d: Optional[str] = None,
+    is_3d: bool = False,
+    two_stage: bool = False,
+) -> List[Dict[str, Any]]:
+    """Implicit-GEMM conv launch signature for one direction.
+
+    ``direction`` is ``"fwd"``, ``"wgrad"`` or ``"dgrad"``; ``dtype`` sets all
+    three operand types unless ``dtype_b`` / ``dtype_d`` override them, which
+    mixed-precision configs need. ``two_stage`` adds wgrad's f32 workspace
+    pair and is rejected for the other two directions.
+
+    One entry point rather than three: the direction is already a value every
+    caller has in hand, so making it an argument removes the per-direction
+    branch each of them used to carry.
+    """
+    return _conv_signature(
+        conv_arg_names(direction=direction, is_3d=is_3d, two_stage=two_stage),
+        dtype,
+        dtype_b or dtype,
+        dtype_d or dtype,
+    )
+
+
+def conv_direct_args_signature(
+    dtype: str = "fp16", *, direction: str = "fwd"
+) -> List[Dict[str, Any]]:
+    """Direct grouped-conv AOT launch signature.
+
+    Direct conv is fp16-only today, but the dtype is threaded through so the
+    signature stays uniform with the implicit-GEMM ones.
+    """
+    return _conv_signature(
+        conv_direct_arg_names(direction=direction), dtype, dtype, dtype
+    )
 
 
 def attention_args_signature(*, path: str = "2d") -> List[Dict[str, Any]]:
@@ -341,6 +398,24 @@ def make_gemm_manifest(
     return manifest
 
 
+def _conv_manifest_signature(dtype: str, conv_layout: str, direction: str):
+    """Launch signature recorded in a conv manifest.
+
+    Conv kernels are AOT: the problem shape travels as kernargs, so the
+    manifest has to advertise the full runtime block rather than the old
+    six-argument pointer ABI, or the runner packs the wrong bytes.
+    """
+    if conv_layout == "direct":
+        return conv_direct_args_signature(dtype, direction=direction)
+    # The 3-D block interleaves the depth extents with the 2-D ones, so the
+    # layout -- not just the direction -- picks the signature. Every direction
+    # declares both forms, so the flag threads through uniformly and no
+    # direction can silently drop it.
+    return conv_args_signature(
+        dtype, direction=direction, is_3d=conv_layout == "implicit_gemm_3d"
+    )
+
+
 def make_conv_manifest(
     *,
     artifact: KernelArtifact,
@@ -356,6 +431,7 @@ def make_conv_manifest(
     grid_explicit: Optional[Sequence[int]] = None,
     grid_order: Optional[str] = None,
     conv_layout: str = "implicit_gemm",
+    direction: str = "fwd",
     warmup_iters: int = 5,
     timed_iters: int = 100,
     atoms: Iterable[str] = (),
@@ -399,7 +475,7 @@ def make_conv_manifest(
         "groups": int(groups),
         "cpg": int(cpg),
         "kpg": int(kpg),
-        "args_signature": conv_args_signature(dtype),
+        "args_signature": _conv_manifest_signature(dtype, conv_layout, direction),
         "sig_has_bytes": 1,
         "timing_ms": dict(artifact.timings),
         "hsaco_bytes": artifact.hsaco_bytes,

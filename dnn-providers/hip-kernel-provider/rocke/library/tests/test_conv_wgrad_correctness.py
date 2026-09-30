@@ -327,6 +327,7 @@ def _run_one(
     import torch
 
     from rocke import compile_kernel
+    from kernels.common.conv_args import ConvArgs
     from rocke.helpers.manifest import conv_args_signature
     from kernels.common.conv_implicit_gemm_wgrad import (
         build_implicit_gemm_conv_wgrad,
@@ -397,7 +398,12 @@ def _run_one(
     rt.memcpy_h2d(X_dev, _u8(X_t), X_t.nbytes)
     rt.memset(dW_dev, 0, dW_t.nbytes)  # split-K atomic-add needs a zeroed dW
 
-    sig = conv_args_signature(dtype)
+    sig = conv_args_signature(
+        dtype,
+        direction="wgrad",
+        is_3d=spec.problem.is_3d,
+        two_stage=bool(getattr(spec, "two_stage", False)),
+    )
     try:
         launcher = KernelLauncher(
             hsaco=artifact.hsaco,
@@ -419,14 +425,21 @@ def _run_one(
     grid = (gx, gy, gz)
     block = (spec.block_size, 1, 1)
 
-    values = {
-        "A": dY_dev,
-        "B": X_dev,
-        "D": dW_dev,
-        "A_bytes": dY_t.nbytes,
-        "B_bytes": X_t.nbytes,
-        "D_bytes": dW_t.nbytes,
-    }
+    values = ConvArgs.from_problem(
+        spec.problem,
+        direction="wgrad",
+        tile_m=spec.tile_m,
+        tile_n=spec.tile_n,
+        tile_k=spec.tile_k,
+    ).to_launch_values(
+        int(dY_dev),
+        int(X_dev),
+        int(dW_dev),
+        dY_t.nbytes,
+        X_t.nbytes,
+        dW_t.nbytes,
+        split_k=max(1, spec.split_k),
+    )
     launcher(values, config=LaunchConfig(grid=grid, block=block, fence=True))
 
     dW_cpu = torch.empty_like(dW_t)
