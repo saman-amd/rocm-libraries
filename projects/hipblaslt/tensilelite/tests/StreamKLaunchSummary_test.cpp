@@ -992,7 +992,7 @@ TEST(StreamKLaunchSummaryTest, GeneratedKernelNameKeepsOrigamiReduction)
     AnalyticalEnv       env;
     ContractionSolution solution;
     initStreamKSolution(solution, 3);
-    env.device.skDynamicGrid = static_cast<int>(origami::grid_selection_t::k_split_aware);
+    env.device.persistentDynamicGrid = static_cast<int>(origami::grid_selection_t::k_split_aware);
 
     // This shape selects parallel reduction on the 256-CU analytical device.
     auto problem = makeGemmProblem(256, 4096, 4096);
